@@ -80,6 +80,22 @@
       >
         Stream torrents with ease
       </h1>
+      <div id="saved-torrents-wrapper" class="hidden w-full mb-6">
+        <div class="text-sm font-semibold mb-2 text-muted-foreground">
+          Saved Torrents
+        </div>
+        <div class="flex flex-col sm:flex-row gap-3">
+          <select
+            id="saved-torrents"
+            class="file:text-foreground placeholder:text-muted-foreground selection:bg-primary selection:text-primary-foreground dark:bg-input/30 border-input flex w-full min-w-0 rounded-md border bg-transparent px-3 py-1 text-base shadow-xs transition-[color,box-shadow] outline-none disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50 md:text-sm focus-visible:border-ring focus-visible:ring-ring/50 focus-visible:ring-[3px] aria-invalid:ring-destructive/20 dark:aria-invalid:ring-destructive/40 aria-invalid:border-destructive h-12 overflow-ellipsis overflow-hidden"
+          >
+            <option value="">Select saved torrent...</option>
+          </select>
+          <button id="play-saved" class="btn whitespace-nowrap" type="button">
+            Play Saved
+          </button>
+        </div>
+      </div>
       <div id="search-wrapper" class="hidden w-full">
         <form id="search-form" class="w-full flex items-center gap-3">
           <input

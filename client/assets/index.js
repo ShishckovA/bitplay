@@ -3,6 +3,15 @@ const getLanguage = (code) => {
   return lang.of(code);
 };
 
+const getVideoMimeType = (fileName) => {
+  const name = String(fileName || "").toLowerCase();
+  if (name.endsWith(".mp4") || name.endsWith(".m4v")) return "video/mp4";
+  if (name.endsWith(".webm")) return "video/webm";
+  // For containers with inconsistent browser support (mkv/avi/mov),
+  // let the browser sniff and decide instead of forcing a likely-wrong MIME.
+  return "";
+};
+
 let settings = {
   enableProxy: false,
   proxyUrl: "",
@@ -85,6 +94,62 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
   });
 
   const form = document.querySelector("#torrent-form");
+  const savedTorrentsWrapper = document.querySelector("#saved-torrents-wrapper");
+  const savedTorrentsSelect = document.querySelector("#saved-torrents");
+  const playSavedButton = document.querySelector("#play-saved");
+
+  const loadSavedTorrents = async () => {
+    try {
+      const response = await fetch("/api/v1/torrents");
+      if (!response.ok) {
+        throw new Error("Failed to fetch saved torrents");
+      }
+
+      const torrents = await response.json();
+      savedTorrentsSelect.innerHTML =
+        '<option value="">Select saved torrent...</option>';
+
+      if (!Array.isArray(torrents) || torrents.length === 0) {
+        savedTorrentsWrapper.classList.add("hidden");
+        return;
+      }
+
+      torrents.forEach((torrent) => {
+        if (!torrent?.magnet) return;
+        const option = document.createElement("option");
+        option.value = torrent.magnet;
+        option.dataset.torrentId = torrent.id || "";
+        const fileCount = Array.isArray(torrent.files) ? torrent.files.length : 0;
+        const title = torrent.name || torrent.id || "Unnamed torrent";
+        option.textContent =
+          fileCount > 0 ? `${title} (${fileCount} files)` : title;
+        savedTorrentsSelect.appendChild(option);
+      });
+
+      savedTorrentsWrapper.classList.remove("hidden");
+    } catch (error) {
+      console.error("Failed to load saved torrents:", error);
+      savedTorrentsWrapper.classList.add("hidden");
+    }
+  };
+
+  playSavedButton.addEventListener("click", () => {
+    const selectedMagnet = savedTorrentsSelect.value;
+    if (!selectedMagnet) {
+      butterup.toast({
+        message: "Please select a saved torrent",
+        location: "top-right",
+        icon: true,
+        dismissable: true,
+        type: "error",
+      });
+      return;
+    }
+
+    document.querySelector("#magnet").value = selectedMagnet;
+    form.dispatchEvent(new Event("submit"));
+  });
+
   form.addEventListener("submit", async (e) => {
     e.preventDefault();
     const magnet = document.querySelector("#magnet").value;
@@ -135,7 +200,7 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
       form.querySelector("button[type=submit]").removeAttribute("disabled");
       form.querySelector("button[type=submit]").innerHTML = "Play Now";
       form.querySelector("button[type=submit]").classList.remove("loader");
-      searchResults.querySelectorAll("#play-torrent").forEach((el) => {
+      document.querySelectorAll("#play-torrent").forEach((el) => {
         el.removeAttribute("disabled");
         el.innerHTML = "Watch";
         el.classList.remove("loader");
@@ -200,7 +265,7 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
       return {
         src: "/api/v1/torrent/" + sessionId + "/stream/" + file.index,
         title: file.name,
-        type: "video/mp4",
+        type: getVideoMimeType(file.name),
       };
     });
 
@@ -232,6 +297,14 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
         };
       });
     }
+    const initialSource = {
+      src: videoUrls[0].src,
+      label: videoUrls[0].title,
+    };
+    if (videoUrls[0].type) {
+      initialSource.type = videoUrls[0].type;
+    }
+
     player = videojs(
       "video-player",
       {
@@ -239,11 +312,7 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
         controls: true,
         autoplay: true,
         preload: "auto",
-        sources: [{
-          src: videoUrls[0].src,
-          type: videoUrls[0].type,
-          label: videoUrls[0].title,
-        }],
+        sources: [initialSource],
         tracks: subtitles,
         html5: {
           nativeTextTracks: false
@@ -294,10 +363,17 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
         });
         videoSelect.addEventListener("change", (e) => {
           const selectedSrc = e.target.value;
-          player.src({
-            src: selectedSrc,
-            type: "video/mp4",
-          });
+          const selectedVideo = videoUrls.find((video) => video.src === selectedSrc);
+          if (selectedVideo?.type) {
+            player.src({
+              src: selectedSrc,
+              type: selectedVideo.type,
+            });
+          } else {
+            player.src({
+              src: selectedSrc,
+            });
+          }
           player.play();
         });
         document.querySelector("#video-player").appendChild(videoSelect);
@@ -313,6 +389,7 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
       el.innerHTML = "Watch";
       el.classList.remove("loader");
     });
+    loadSavedTorrents();
   });
 
   // create switch button
@@ -1030,6 +1107,8 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
       }
     }
   });
+
+  loadSavedTorrents();
 
   // fetch settings
   fetch("/api/v1/settings")

@@ -1,8 +1,13 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/base32"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +19,7 @@ import (
 	"os"
 	"reflect"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,6 +31,7 @@ import (
 	"github.com/anacrolix/torrent"
 	"github.com/anacrolix/torrent/metainfo"
 	"github.com/anacrolix/torrent/storage"
+	bolt "go.etcd.io/bbolt"
 	"golang.org/x/net/proxy"
 )
 
@@ -68,11 +75,47 @@ type JackettSettings struct {
 	JackettApiKey string `json:"jackettApiKey"`
 }
 
+type StoredTorrentFile struct {
+	Index int    `json:"index"`
+	Name  string `json:"name"`
+	Size  int64  `json:"size"`
+}
+
+type StoredTorrent struct {
+	ID         string              `json:"id"`
+	Magnet     string              `json:"magnet"`
+	Name       string              `json:"name"`
+	Files      []StoredTorrentFile `json:"files"`
+	MetaInfo   []byte              `json:"metaInfo,omitempty"`
+	AddedAt    time.Time           `json:"addedAt"`
+	LastUsedAt time.Time           `json:"lastUsedAt"`
+}
+
+type StoredTorrentView struct {
+	ID         string              `json:"id"`
+	Magnet     string              `json:"magnet"`
+	Name       string              `json:"name"`
+	Files      []StoredTorrentFile `json:"files"`
+	AddedAt    time.Time           `json:"addedAt"`
+	LastUsedAt time.Time           `json:"lastUsedAt"`
+}
+
+type BasicAuthConfig struct {
+	Enabled  bool
+	Username string
+	Password string
+	Realm    string
+}
+
 var (
 	sessions  sync.Map
 	usedPorts sync.Map
 	portMutex sync.Mutex
+
+	torrentDB *bolt.DB
 )
+
+const torrentBucketName = "torrents"
 
 // Helper function to format file sizes
 func formatSize(sizeInBytes float64) string {
@@ -313,17 +356,404 @@ func init() {
 	settingsMutex.Unlock()
 }
 
+func initTorrentStore(path string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return fmt.Errorf("failed to create torrent db directory: %w", err)
+	}
+
+	db, err := bolt.Open(path, 0600, &bolt.Options{Timeout: time.Second})
+	if err != nil {
+		return fmt.Errorf("failed to open torrent db: %w", err)
+	}
+
+	if err := db.Update(func(tx *bolt.Tx) error {
+		_, err := tx.CreateBucketIfNotExists([]byte(torrentBucketName))
+		return err
+	}); err != nil {
+		db.Close()
+		return fmt.Errorf("failed to initialize torrent db bucket: %w", err)
+	}
+
+	torrentDB = db
+	return nil
+}
+
+func normalizeTorrentID(id string) string {
+	return strings.ToLower(strings.TrimSpace(id))
+}
+
+func extractInfoHashFromMagnet(magnetURI string) string {
+	parsed, err := url.Parse(strings.TrimSpace(magnetURI))
+	if err != nil || !strings.EqualFold(parsed.Scheme, "magnet") {
+		return ""
+	}
+
+	for _, xt := range parsed.Query()["xt"] {
+		if !strings.HasPrefix(strings.ToLower(xt), "urn:btih:") {
+			continue
+		}
+
+		hashPart := strings.TrimSpace(xt[len("urn:btih:"):])
+		switch len(hashPart) {
+		case 40:
+			if _, err := hex.DecodeString(hashPart); err == nil {
+				return strings.ToLower(hashPart)
+			}
+		case 32:
+			decoded, err := base32.StdEncoding.WithPadding(base32.NoPadding).DecodeString(strings.ToUpper(hashPart))
+			if err == nil && len(decoded) == 20 {
+				return hex.EncodeToString(decoded)
+			}
+		}
+	}
+
+	return ""
+}
+
+func storeTorrentRecord(record StoredTorrent) error {
+	if torrentDB == nil {
+		return errors.New("torrent db is not initialized")
+	}
+
+	record.ID = normalizeTorrentID(record.ID)
+	if record.ID == "" {
+		return errors.New("empty torrent id")
+	}
+
+	now := time.Now().UTC()
+	if record.LastUsedAt.IsZero() {
+		record.LastUsedAt = now
+	}
+
+	return torrentDB.Update(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket([]byte(torrentBucketName))
+		if bucket == nil {
+			return errors.New("torrent bucket is missing")
+		}
+
+		key := []byte(record.ID)
+		existingRaw := bucket.Get(key)
+		if len(existingRaw) > 0 {
+			var existing StoredTorrent
+			if err := json.Unmarshal(existingRaw, &existing); err == nil {
+				if record.Magnet == "" {
+					record.Magnet = existing.Magnet
+				}
+				if record.Name == "" {
+					record.Name = existing.Name
+				}
+				if len(record.Files) == 0 {
+					record.Files = existing.Files
+				}
+				if len(record.MetaInfo) == 0 {
+					record.MetaInfo = existing.MetaInfo
+				}
+				if record.AddedAt.IsZero() {
+					record.AddedAt = existing.AddedAt
+				}
+			}
+		}
+
+		if record.AddedAt.IsZero() {
+			record.AddedAt = now
+		}
+
+		payload, err := json.Marshal(record)
+		if err != nil {
+			return err
+		}
+
+		return bucket.Put(key, payload)
+	})
+}
+
+func markStoredTorrentUsed(id string) {
+	id = normalizeTorrentID(id)
+	if id == "" || torrentDB == nil {
+		return
+	}
+
+	_ = torrentDB.Update(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket([]byte(torrentBucketName))
+		if bucket == nil {
+			return nil
+		}
+
+		raw := bucket.Get([]byte(id))
+		if len(raw) == 0 {
+			return nil
+		}
+
+		var existing StoredTorrent
+		if err := json.Unmarshal(raw, &existing); err != nil {
+			return nil
+		}
+
+		existing.LastUsedAt = time.Now().UTC()
+		updated, err := json.Marshal(existing)
+		if err != nil {
+			return nil
+		}
+
+		return bucket.Put([]byte(id), updated)
+	})
+}
+
+func getStoredTorrent(id string) (*StoredTorrent, error) {
+	if torrentDB == nil {
+		return nil, errors.New("torrent db is not initialized")
+	}
+
+	id = normalizeTorrentID(id)
+	if id == "" {
+		return nil, nil
+	}
+
+	var result *StoredTorrent
+	err := torrentDB.View(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket([]byte(torrentBucketName))
+		if bucket == nil {
+			return errors.New("torrent bucket is missing")
+		}
+
+		raw := bucket.Get([]byte(id))
+		if len(raw) == 0 {
+			return nil
+		}
+
+		var record StoredTorrent
+		if err := json.Unmarshal(raw, &record); err != nil {
+			return err
+		}
+
+		result = &record
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return result, nil
+}
+
+func listStoredTorrents() ([]StoredTorrent, error) {
+	if torrentDB == nil {
+		return nil, errors.New("torrent db is not initialized")
+	}
+
+	var results []StoredTorrent
+	err := torrentDB.View(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket([]byte(torrentBucketName))
+		if bucket == nil {
+			return errors.New("torrent bucket is missing")
+		}
+
+		return bucket.ForEach(func(_, value []byte) error {
+			var record StoredTorrent
+			if err := json.Unmarshal(value, &record); err != nil {
+				return err
+			}
+			results = append(results, record)
+			return nil
+		})
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	sort.Slice(results, func(i, j int) bool {
+		left := results[i].LastUsedAt
+		if left.IsZero() {
+			left = results[i].AddedAt
+		}
+		right := results[j].LastUsedAt
+		if right.IsZero() {
+			right = results[j].AddedAt
+		}
+		return left.After(right)
+	})
+
+	return results, nil
+}
+
+func buildStoredTorrentFromSession(sessionID, magnet string, t *torrent.Torrent) StoredTorrent {
+	files := make([]StoredTorrentFile, 0, len(t.Files()))
+	for i, file := range t.Files() {
+		files = append(files, StoredTorrentFile{
+			Index: i,
+			Name:  file.DisplayPath(),
+			Size:  file.Length(),
+		})
+	}
+
+	var metaBytes []byte
+	mi := t.Metainfo()
+	var buf bytes.Buffer
+	if err := mi.Write(&buf); err == nil && buf.Len() > 0 {
+		metaBytes = buf.Bytes()
+	}
+
+	name := strings.TrimSpace(t.Name())
+	if name == "" {
+		name = sessionID
+	}
+
+	return StoredTorrent{
+		ID:         normalizeTorrentID(sessionID),
+		Magnet:     strings.TrimSpace(magnet),
+		Name:       name,
+		Files:      files,
+		MetaInfo:   metaBytes,
+		LastUsedAt: time.Now().UTC(),
+	}
+}
+
+func toStoredTorrentView(record StoredTorrent) StoredTorrentView {
+	return StoredTorrentView{
+		ID:         record.ID,
+		Magnet:     record.Magnet,
+		Name:       record.Name,
+		Files:      record.Files,
+		AddedAt:    record.AddedAt,
+		LastUsedAt: record.LastUsedAt,
+	}
+}
+
+func loadDotEnvFile(path string) error {
+	file, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	lineNumber := 0
+	for scanner.Scan() {
+		lineNumber++
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		line = strings.TrimPrefix(line, "export ")
+		line = strings.TrimSpace(line)
+
+		separator := strings.Index(line, "=")
+		if separator <= 0 {
+			log.Printf("Skipping malformed .env line %d", lineNumber)
+			continue
+		}
+
+		key := strings.TrimSpace(line[:separator])
+		if key == "" {
+			log.Printf("Skipping malformed .env line %d", lineNumber)
+			continue
+		}
+
+		value := strings.TrimSpace(line[separator+1:])
+		quoted := len(value) >= 2 && ((value[0] == '"' && value[len(value)-1] == '"') || (value[0] == '\'' && value[len(value)-1] == '\''))
+		if quoted {
+			value = value[1 : len(value)-1]
+		} else {
+			if commentIndex := strings.Index(value, " #"); commentIndex >= 0 {
+				value = strings.TrimSpace(value[:commentIndex])
+			}
+		}
+
+		if _, exists := os.LookupEnv(key); exists {
+			continue
+		}
+		if err := os.Setenv(key, value); err != nil {
+			return fmt.Errorf("failed to set env var %q from .env: %w", key, err)
+		}
+	}
+
+	return scanner.Err()
+}
+
+func loadBasicAuthConfig() BasicAuthConfig {
+	username := os.Getenv("BITPLAY_AUTH_USERNAME")
+	password := os.Getenv("BITPLAY_AUTH_PASSWORD")
+
+	if username == "" && password == "" {
+		log.Println("HTTP basic auth is disabled (BITPLAY_AUTH_USERNAME/BITPLAY_AUTH_PASSWORD are not set).")
+		return BasicAuthConfig{}
+	}
+
+	if username == "" || password == "" {
+		log.Fatal("Both BITPLAY_AUTH_USERNAME and BITPLAY_AUTH_PASSWORD must be set to enable auth.")
+	}
+
+	realm := os.Getenv("BITPLAY_AUTH_REALM")
+	if strings.TrimSpace(realm) == "" {
+		realm = "BitPlay"
+	}
+
+	log.Printf("HTTP basic auth is enabled for realm %q", realm)
+	return BasicAuthConfig{
+		Enabled:  true,
+		Username: username,
+		Password: password,
+		Realm:    realm,
+	}
+}
+
+func secureStringEqual(a, b string) bool {
+	aHash := sha256.Sum256([]byte(a))
+	bHash := sha256.Sum256([]byte(b))
+	return subtle.ConstantTimeCompare(aHash[:], bHash[:]) == 1
+}
+
+func withBasicAuth(next http.Handler, cfg BasicAuthConfig) http.Handler {
+	if !cfg.Enabled {
+		return next
+	}
+
+	challenge := fmt.Sprintf(`Basic realm=%q, charset="UTF-8"`, cfg.Realm)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		username, password, ok := r.BasicAuth()
+		if !ok || !secureStringEqual(username, cfg.Username) || !secureStringEqual(password, cfg.Password) {
+			w.Header().Set("WWW-Authenticate", challenge)
+			if strings.HasPrefix(r.URL.Path, "/api/") {
+				respondWithJSON(w, http.StatusUnauthorized, map[string]string{"error": "Unauthorized"})
+			} else {
+				http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			}
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
 func main() {
 	// Seed random number generator
 	rand.Seed(time.Now().UnixNano())
 
+	if err := loadDotEnvFile(".env"); err != nil {
+		log.Printf("Warning: failed to load .env file: %v", err)
+	}
+
 	// Force proxy for all Go HTTP connections
 	setGlobalProxy()
 
+	if err := initTorrentStore("config/torrents.db"); err != nil {
+		log.Fatalf("Failed to initialize torrent store: %v", err)
+	}
+	defer torrentDB.Close()
+
+	authConfig := loadBasicAuthConfig()
+
+	appMux := http.NewServeMux()
+
 	// Set up endpoint handlers
-	http.HandleFunc("/api/v1/torrent/add", addTorrentHandler)
-	http.HandleFunc("/api/v1/torrent/", torrentHandler)
-	http.HandleFunc("/api/v1/settings", func(w http.ResponseWriter, r *http.Request) {
+	appMux.HandleFunc("/api/v1/torrent/add", addTorrentHandler)
+	appMux.HandleFunc("/api/v1/torrent/", torrentHandler)
+	appMux.HandleFunc("/api/v1/torrents", listSavedTorrentsHandler)
+	appMux.HandleFunc("/api/v1/settings", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet {
 			settingsMutex.RLock()
 			defer settingsMutex.RUnlock()
@@ -332,22 +762,22 @@ func main() {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		}
 	})
-	http.HandleFunc("/api/v1/settings/proxy", saveProxySettingsHandler)
-	http.HandleFunc("/api/v1/settings/prowlarr", saveProwlarrSettingsHandler)
-	http.HandleFunc("/api/v1/settings/jackett", saveJackettSettingsHandler)
-	http.HandleFunc("/api/v1/prowlarr/search", searchFromProwlarr)
-	http.HandleFunc("/api/v1/jackett/search", searchFromJackett)
-	http.HandleFunc("/api/v1/prowlarr/test", testProwlarrConnection)
-	http.HandleFunc("/api/v1/jackett/test", testJackettConnection)
-	http.HandleFunc("/api/v1/proxy/test", testProxyConnection)
-	http.HandleFunc("/api/v1/torrent/convert", convertTorrentToMagnetHandler)
+	appMux.HandleFunc("/api/v1/settings/proxy", saveProxySettingsHandler)
+	appMux.HandleFunc("/api/v1/settings/prowlarr", saveProwlarrSettingsHandler)
+	appMux.HandleFunc("/api/v1/settings/jackett", saveJackettSettingsHandler)
+	appMux.HandleFunc("/api/v1/prowlarr/search", searchFromProwlarr)
+	appMux.HandleFunc("/api/v1/jackett/search", searchFromJackett)
+	appMux.HandleFunc("/api/v1/prowlarr/test", testProwlarrConnection)
+	appMux.HandleFunc("/api/v1/jackett/test", testJackettConnection)
+	appMux.HandleFunc("/api/v1/proxy/test", testProxyConnection)
+	appMux.HandleFunc("/api/v1/torrent/convert", convertTorrentToMagnetHandler)
 
 	// Set up client file serving
-	http.Handle("/", http.FileServer(http.Dir("./client")))
-	http.HandleFunc("/client/", func(w http.ResponseWriter, r *http.Request) {
+	appMux.Handle("/", http.FileServer(http.Dir("./client")))
+	appMux.HandleFunc("/client/", func(w http.ResponseWriter, r *http.Request) {
 		http.StripPrefix("/client/", http.FileServer(http.Dir("./client"))).ServeHTTP(w, r)
 	})
-	http.HandleFunc("/favicon.ico", func(w http.ResponseWriter, r *http.Request) {
+	appMux.HandleFunc("/favicon.ico", func(w http.ResponseWriter, r *http.Request) {
 		http.ServeFile(w, r, "./client/favicon.ico")
 	})
 
@@ -364,7 +794,7 @@ func main() {
 	// Create a server with graceful shutdown
 	server := &http.Server{
 		Addr:    addr,
-		Handler: nil, // Use the default ServeMux
+		Handler: withBasicAuth(appMux, authConfig),
 	}
 
 	// Start the server in a goroutine
@@ -427,88 +857,62 @@ func setGlobalProxy() {
 	}
 }
 
-// Handler to add a torrent using a magnet link
-func addTorrentHandler(w http.ResponseWriter, r *http.Request) {
-	var request struct{ Magnet string }
-	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-		respondWithJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid request"})
-		return
-	}
-
-	magnet := request.Magnet
+func resolveMagnetInput(input string) (string, error) {
+	magnet := strings.TrimSpace(input)
 	if magnet == "" {
-		respondWithJSON(w, http.StatusBadRequest, map[string]string{"error": "No magnet link provided"})
+		return "", errors.New("no magnet link provided")
 	}
 
-	// handle http links like Prowlarr or Jackett
-	if strings.HasPrefix(request.Magnet, "http") {
-		// Use the client that bypasses proxy for Prowlarr
+	// Handle HTTP links from search providers that redirect to magnet URIs.
+	if strings.HasPrefix(strings.ToLower(magnet), "http") {
 		httpClient := createSelectiveProxyClient()
-
 		httpClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
 		}
 
-		// Make the HTTP request to follow the Prowlarr link
-		req, err := http.NewRequest("GET", request.Magnet, nil)
+		req, err := http.NewRequest("GET", magnet, nil)
 		if err != nil {
-			log.Printf("Error creating request: %v", err)
-			respondWithJSON(w, http.StatusBadRequest, map[string]string{
-				"error": "Invalid URL: " + err.Error(),
-			})
-			return
+			return "", fmt.Errorf("invalid URL: %w", err)
 		}
-
 		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
 
-		// Follow the Prowlarr link
-		log.Printf("Following Prowlarr URL: %s", request.Magnet)
 		resp, err := httpClient.Do(req)
 		if err != nil {
-			log.Printf("Error following URL: %v", err)
-			respondWithJSON(w, http.StatusBadRequest, map[string]string{
-				"error": "Failed to download: " + err.Error(),
-			})
-			return
+			return "", fmt.Errorf("failed to download: %w", err)
 		}
 		defer resp.Body.Close()
 
-		log.Printf("Got response: %d %s", resp.StatusCode, resp.Status)
-
-		// Check for redirects to magnet links
 		if resp.StatusCode >= 300 && resp.StatusCode < 400 {
-			location := resp.Header.Get("Location")
-			log.Printf("Found redirect to: %s", location)
-
-			if strings.HasPrefix(location, "magnet:") {
-				log.Printf("Found magnet redirect: %s", location)
+			location := strings.TrimSpace(resp.Header.Get("Location"))
+			if strings.HasPrefix(strings.ToLower(location), "magnet:") {
 				magnet = location
 			} else {
-				log.Printf("Non-magnet redirect: %s", location)
-				respondWithJSON(w, http.StatusBadRequest, map[string]string{
-					"error": "URL redirects to non-magnet content",
-				})
-				return
+				return "", errors.New("URL redirects to non-magnet content")
 			}
 		}
 	}
 
-	// check if magnet link is valid
-	if magnet == "" || !strings.HasPrefix(magnet, "magnet:") {
-		respondWithJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid magnet link"})
-		return
+	if !strings.HasPrefix(strings.ToLower(magnet), "magnet:") {
+		return "", errors.New("invalid magnet link")
 	}
+	return magnet, nil
+}
 
-	// Use the simpler, more secure proxy configuration
+func waitForTorrentInfo(t *torrent.Torrent, timeout time.Duration) error {
+	select {
+	case <-t.GotInfo():
+		return nil
+	case <-time.After(timeout):
+		return errors.New("timeout getting info - proxy might be blocking BitTorrent traffic")
+	}
+}
+
+func createSessionFromMagnet(magnet string) (string, error) {
 	client, port, err := initTorrentWithProxy()
 	if err != nil {
-		log.Printf("Client creation error: %v", err)
-		respondWithJSON(w, http.StatusInternalServerError,
-			map[string]string{"error": "Failed to create client with proxy"})
-		return
+		return "", fmt.Errorf("failed to create client with proxy: %w", err)
 	}
 
-	// if we bail out before session‑storage, make sure to release both client & port
 	defer func() {
 		if client != nil {
 			releasePort(port)
@@ -518,100 +922,233 @@ func addTorrentHandler(w http.ResponseWriter, r *http.Request) {
 
 	t, err := client.AddMagnet(magnet)
 	if err != nil {
-		respondWithJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid magnet url"})
-		return
-	}
-	log.Printf("Torrent added: %s", t.InfoHash().HexString())
-
-	select {
-	case <-t.GotInfo():
-		log.Printf("Successfully got torrent info for %s", t.InfoHash().HexString())
-	case <-time.After(3 * time.Minute):
-		respondWithJSON(w, http.StatusGatewayTimeout, map[string]string{"error": "Timeout getting info - proxy might be blocking BitTorrent traffic"})
+		return "", fmt.Errorf("invalid magnet url: %w", err)
 	}
 
-	sessionID := t.InfoHash().HexString()
-	log.Printf("Creating new session with ID: %s", sessionID)
+	if err := waitForTorrentInfo(t, 3*time.Minute); err != nil {
+		return "", err
+	}
+
+	sessionID := normalizeTorrentID(t.InfoHash().HexString())
 	sessions.Store(sessionID, &TorrentSession{
 		Client:   client,
 		Torrent:  t,
 		Port:     port,
 		LastUsed: time.Now(),
 	})
-
-	// Log successful storage
-	log.Printf("Successfully stored session: %s", sessionID)
-
-	// Set client to nil so it doesn't get closed by the defer function
-	// since it's now stored in the sessions map
 	client = nil
 
+	record := buildStoredTorrentFromSession(sessionID, magnet, t)
+	if err := storeTorrentRecord(record); err != nil {
+		log.Printf("Warning: failed to persist torrent %s: %v", sessionID, err)
+	}
+
+	return sessionID, nil
+}
+
+func createSessionFromRecord(record *StoredTorrent) (string, error) {
+	client, port, err := initTorrentWithProxy()
+	if err != nil {
+		return "", fmt.Errorf("failed to create client with proxy: %w", err)
+	}
+
+	defer func() {
+		if client != nil {
+			releasePort(port)
+			client.Close()
+		}
+	}()
+
+	var t *torrent.Torrent
+	if len(record.MetaInfo) > 0 {
+		if mi, err := metainfo.Load(bytes.NewReader(record.MetaInfo)); err == nil {
+			t, err = client.AddTorrent(mi)
+			if err != nil {
+				log.Printf("Warning: failed to add torrent from cached metainfo for %s: %v", record.ID, err)
+			}
+		} else {
+			log.Printf("Warning: failed to parse cached metainfo for %s: %v", record.ID, err)
+		}
+	}
+
+	if t == nil {
+		if record.Magnet == "" {
+			return "", errors.New("stored torrent has no magnet link")
+		}
+		t, err = client.AddMagnet(record.Magnet)
+		if err != nil {
+			return "", fmt.Errorf("failed to restore magnet session: %w", err)
+		}
+	}
+
+	if err := waitForTorrentInfo(t, 3*time.Minute); err != nil {
+		return "", err
+	}
+
+	sessionID := normalizeTorrentID(t.InfoHash().HexString())
+	sessions.Store(sessionID, &TorrentSession{
+		Client:   client,
+		Torrent:  t,
+		Port:     port,
+		LastUsed: time.Now(),
+	})
+	client = nil
+
+	updatedRecord := buildStoredTorrentFromSession(sessionID, record.Magnet, t)
+	updatedRecord.AddedAt = record.AddedAt
+	if err := storeTorrentRecord(updatedRecord); err != nil {
+		log.Printf("Warning: failed to refresh stored torrent %s: %v", sessionID, err)
+	}
+
+	return sessionID, nil
+}
+
+func ensureTorrentSession(sessionID string) (*TorrentSession, error) {
+	sessionID = normalizeTorrentID(sessionID)
+	if sessionID == "" {
+		return nil, errors.New("empty torrent id")
+	}
+
+	if value, ok := sessions.Load(sessionID); ok {
+		session := value.(*TorrentSession)
+		session.LastUsed = time.Now()
+		markStoredTorrentUsed(sessionID)
+		return session, nil
+	}
+
+	record, err := getStoredTorrent(sessionID)
+	if err != nil {
+		return nil, err
+	}
+	if record == nil {
+		return nil, errors.New("torrent not found")
+	}
+
+	restoredID, err := createSessionFromRecord(record)
+	if err != nil {
+		return nil, err
+	}
+
+	value, ok := sessions.Load(restoredID)
+	if !ok {
+		return nil, errors.New("failed to create torrent session")
+	}
+
+	session := value.(*TorrentSession)
+	session.LastUsed = time.Now()
+	markStoredTorrentUsed(restoredID)
+	return session, nil
+}
+
+func getOrCreateSessionByMagnet(magnet string) (string, error) {
+	if infoHash := extractInfoHashFromMagnet(magnet); infoHash != "" {
+		if value, ok := sessions.Load(infoHash); ok {
+			session := value.(*TorrentSession)
+			session.LastUsed = time.Now()
+			markStoredTorrentUsed(infoHash)
+			return infoHash, nil
+		}
+
+		record, err := getStoredTorrent(infoHash)
+		if err != nil {
+			return "", err
+		}
+		if record != nil {
+			return createSessionFromRecord(record)
+		}
+	}
+
+	return createSessionFromMagnet(magnet)
+}
+
+func listSavedTorrentsHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	records, err := listStoredTorrents()
+	if err != nil {
+		log.Printf("Error listing stored torrents: %v", err)
+		respondWithJSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to list stored torrents"})
+		return
+	}
+
+	response := make([]StoredTorrentView, 0, len(records))
+	for _, record := range records {
+		response = append(response, toStoredTorrentView(record))
+	}
+
+	respondWithJSON(w, http.StatusOK, response)
+}
+
+// Handler to add a torrent using a magnet link
+func addTorrentHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var request struct {
+		Magnet string `json:"magnet"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		respondWithJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid request"})
+		return
+	}
+
+	magnet, err := resolveMagnetInput(request.Magnet)
+	if err != nil {
+		respondWithJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+
+	sessionID, err := getOrCreateSessionByMagnet(magnet)
+	if err != nil {
+		if strings.Contains(err.Error(), "timeout getting info") {
+			respondWithJSON(w, http.StatusGatewayTimeout, map[string]string{"error": err.Error()})
+			return
+		}
+		if strings.Contains(err.Error(), "invalid magnet") {
+			respondWithJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid magnet url"})
+			return
+		}
+		log.Printf("Error creating torrent session: %v", err)
+		respondWithJSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to create torrent session"})
+		return
+	}
+
+	markStoredTorrentUsed(sessionID)
 	respondWithJSON(w, http.StatusOK, map[string]string{"sessionId": sessionID})
 }
 
 // Torrent handler to serve torrent files and stream content
 func torrentHandler(w http.ResponseWriter, r *http.Request) {
-	// Log the entire URL path for debugging
-	log.Printf("Torrent handler called with path: %s", r.URL.Path)
-
-	// Extract sessionId and possibly fileIndex from the URL
 	parts := strings.Split(r.URL.Path, "/")
-
-	// Debug the path parts
-	log.Printf("Path parts: %v (length: %d)", parts, len(parts))
-
-	// The URL structure is /api/v1/torrent/[sessionId]/...
-	if len(parts) < 5 { // Changed from 4 to 5
-		log.Printf("Invalid path: not enough parts")
+	if len(parts) < 5 {
 		respondWithJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid path"})
 		return
 	}
 
-	// The session ID is at position 4, not 3 (because array is 0-indexed and path starts with /)
-	sessionID := parts[4] // Changed from parts[3] to parts[4]
-
-	log.Printf("Looking for session with ID: %s", sessionID)
-
-	// Debug: Print all sessions that we have
-	var sessionKeys []string
-	sessions.Range(func(key, value interface{}) bool {
-		keyStr, ok := key.(string)
-		if ok {
-			sessionKeys = append(sessionKeys, keyStr)
-		}
-		return true
-	})
-	log.Printf("Available sessions: %v", sessionKeys)
-
-	// Get the torrent session from our sessions map
-	sessionValue, ok := sessions.Load(sessionID)
-	if !ok {
-		log.Printf("Session not found with ID: %s", sessionID)
+	sessionID := normalizeTorrentID(parts[4])
+	session, err := ensureTorrentSession(sessionID)
+	if err != nil {
 		respondWithJSON(w, http.StatusNotFound, map[string]string{
-			"error":              "Session not found",
-			"id":                 sessionID,
-			"available_sessions": strings.Join(sessionKeys, ", "),
+			"error": "Torrent not found",
+			"id":    sessionID,
 		})
 		return
 	}
 
-	log.Printf("Found session with ID: %s", sessionID)
-	session := sessionValue.(*TorrentSession)
-	session.LastUsed = time.Now() // Update last used time
-
 	// If there's a streaming request, handle it
-	if len(parts) > 5 && parts[5] == "stream" { // Changed from parts[4] to parts[5]
-		if len(parts) < 7 { // Changed from 6 to 7
+	if len(parts) > 5 && parts[5] == "stream" {
+		if len(parts) < 7 {
 			http.Error(w, "Invalid stream path", http.StatusBadRequest)
 			return
 		}
 
-		fileIndexString := parts[6]
-		// remove .vtt from fileIndex if it exists
-		fileIndexString = strings.TrimSuffix(fileIndexString, ".vtt")
-
+		fileIndexString := strings.TrimSuffix(parts[6], ".vtt")
 		fileIndex, err := strconv.Atoi(fileIndexString)
-
 		if err != nil {
 			http.Error(w, "Invalid file index", http.StatusBadRequest)
 			return
@@ -628,8 +1165,6 @@ func torrentHandler(w http.ResponseWriter, r *http.Request) {
 		fileName := file.DisplayPath()
 		extension := strings.ToLower(filepath.Ext(fileName))
 
-		log.Printf("Streaming file: %s (type: %s)", fileName, extension)
-
 		switch extension {
 		case ".mp4":
 			w.Header().Set("Content-Type", "video/mp4")
@@ -643,59 +1178,49 @@ func torrentHandler(w http.ResponseWriter, r *http.Request) {
 			// For SRT, convert to VTT on-the-fly if requested as VTT
 			if r.URL.Query().Get("format") == "vtt" {
 				w.Header().Set("Content-Type", "text/vtt")
-				w.Header().Set("Access-Control-Allow-Origin", "*") // Allow cross-origin requests
+				w.Header().Set("Access-Control-Allow-Origin", "*")
 
-				// Read the SRT file with size limit
 				reader := file.NewReader()
-				// Wrap with limiting reader to prevent memory issues (10MB max)
-				limitReader := io.LimitReader(reader, 10*1024*1024) // 10MB limit for subtitles
+				limitReader := io.LimitReader(reader, 10*1024*1024)
 				srtBytes, err := io.ReadAll(limitReader)
 				if err != nil {
 					http.Error(w, "Failed to read subtitle file", http.StatusInternalServerError)
 					return
 				}
 
-				// Convert from SRT to VTT
 				vttBytes := convertSRTtoVTT(srtBytes)
 				w.Write(vttBytes)
 				return
-			} else {
-				w.Header().Set("Content-Type", "text/plain")
-				w.Header().Set("Access-Control-Allow-Origin", "*") // Allow cross-origin requests
 			}
+			w.Header().Set("Content-Type", "text/plain")
+			w.Header().Set("Access-Control-Allow-Origin", "*")
 		case ".vtt":
 			w.Header().Set("Content-Type", "text/vtt")
-			w.Header().Set("Access-Control-Allow-Origin", "*") // Allow cross-origin requests
+			w.Header().Set("Access-Control-Allow-Origin", "*")
 		case ".sub":
 			w.Header().Set("Content-Type", "text/plain")
-			w.Header().Set("Access-Control-Allow-Origin", "*") // Allow cross-origin requests
+			w.Header().Set("Access-Control-Allow-Origin", "*")
 		default:
 			w.Header().Set("Content-Type", "application/octet-stream")
 		}
 
-		// Add CORS headers for all content
-		// Stream the file
 		reader := file.NewReader()
-		// ServeContent will close the reader when done but we need to
-		// ensure it gets closed if there's a panic or other error
 		defer func() {
 			if closer, ok := reader.(io.Closer); ok {
 				closer.Close()
-				println("Closed reader***************************************")
 			}
 		}()
-		println("Serving content*****************************************")
+
 		http.ServeContent(w, r, fileName, time.Time{}, reader)
 		return
 	}
 
-	// If we get here, just return file list
-	var files []map[string]interface{}
+	files := make([]StoredTorrentFile, 0, len(session.Torrent.Files()))
 	for i, file := range session.Torrent.Files() {
-		files = append(files, map[string]interface{}{
-			"index": i,
-			"name":  file.DisplayPath(),
-			"size":  file.Length(),
+		files = append(files, StoredTorrentFile{
+			Index: i,
+			Name:  file.DisplayPath(),
+			Size:  file.Length(),
 		})
 	}
 

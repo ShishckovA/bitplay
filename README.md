@@ -13,6 +13,8 @@ BitPlay is a web application built with Go that allows you to stream video conte
 *   **Jackett Integration:** Connect to your Jackett instance as an alternative search provider.
 *   **On-the-fly Subtitle Conversion:** Converts SRT subtitles to VTT format for browser compatibility.
 *   **Session Management:** Handles multiple torrent sessions and cleans up inactive ones.
+*   **Built-in HTTP Authentication:** Protect access to both UI and API with HTTP Basic Auth.
+*   **Persistent Torrent Library:** Stores added torrents (metadata + file list) in `config/torrents.db` so they can be reopened from the UI.
 
 ## Getting Started
 
@@ -34,7 +36,12 @@ You can run BitPlay either directly using Go or via Docker Compose.
     ```bash
     go mod download
     ```
-3.  **Run the application:**
+3.  **Create `.env` with auth credentials:**
+    ```bash
+    cp .env.example .env
+    ```
+    Then set `BITPLAY_AUTH_USERNAME` and `BITPLAY_AUTH_PASSWORD` in `.env`.
+4.  **Run the application:**
     ```bash
     go run main.go
     ```
@@ -48,22 +55,27 @@ This is the recommended method for deployment.
     ```yaml
     services:
       bitplay:
-        image: ghcr.io/aculix/bitplay:main
+        build:
+          context: .
+          dockerfile: Dockerfile
+        image: bitplay:local
         container_name: bitplay
         ports:
           - 3347:3347 # Expose the web UI port
+        env_file:
+          - .env
         volumes:
           # Mount the config directory for persistent settings (Optional)
           - ./config:/app/config 
         restart: unless-stopped
     ```
-    *   **Optional Persistence:** By default, settings (Proxy, Prowlarr/Jackett) are stored inside the container and will be lost if the container is restarted. To make settings persistent across restarts, you can mount a local directory from your host to `/app/config` inside the container using the `volumes` option above. 
+    *   **Optional Persistence:** By default, settings and saved torrent library are stored inside the container and will be lost if the container is restarted. To make them persistent across restarts, mount a local directory from your host to `/app/config` inside the container using the `volumes` option above. 
     *   If you choose to mount the directory for persistence, you **must** create the directory on your host machine **before** starting the container for the first time: `mkdir -p ./config`. 
     *   If you don't mount this volume, the application will still function correctly, but you will need to re-configure your settings after each container restart. Torrent data itself is always ephemeral.
 
 2.  **Start the container:**
     ```bash
-    docker-compose up -d
+    docker compose up -d --build
     ```
 3.  **Access the application:** Open your browser to `http://<your-server-ip>:3347`.
 
@@ -71,7 +83,7 @@ This is the recommended method for deployment.
 
 Alternatively, you can run the container directly using `docker run`:
 
-1.  **(Optional) Create the config directory for persistence:** If you want your settings (Proxy, Prowlarr/Jackett) to persist across container restarts, create the configuration directory on your host first:
+1.  **(Optional) Create the config directory for persistence:** If you want your settings and saved torrents to persist across container restarts, create the configuration directory on your host first:
     ```bash
     mkdir -p ./config
     ```
@@ -82,6 +94,8 @@ Alternatively, you can run the container directly using `docker run`:
     docker run -d \
       --name bitplay \
       -p 3347:3347 \
+      -e BITPLAY_AUTH_USERNAME=your_user \
+      -e BITPLAY_AUTH_PASSWORD=your_strong_password \
       # Add the volume mount below ONLY if you want persistent settings (and created ./config above)
       -v $(pwd)/config:/app/config \
       --restart unless-stopped \
@@ -96,6 +110,26 @@ Alternatively, you can run the container directly using `docker run`:
 
 3.  **Access the application:** Open your browser to `http://<your-server-ip>:3347`.
 
+### Access Protection (HTTP Basic Auth)
+
+BitPlay can require authentication for the full app (web UI + all `/api/*` routes).
+
+Use these environment variables:
+
+*   `BITPLAY_AUTH_USERNAME` (required if auth is enabled)
+*   `BITPLAY_AUTH_PASSWORD` (required if auth is enabled)
+*   `BITPLAY_AUTH_REALM` (optional, defaults to `BitPlay`)
+
+BitPlay reads `.env` automatically on startup (if the file exists). Existing process environment variables have priority over `.env`.
+
+Behavior:
+
+*   If both username and password are set, auth is enabled globally.
+*   If only one of them is set, BitPlay exits with an error.
+*   If both are missing, auth is disabled.
+
+> Important: HTTP Basic Auth credentials are sent with every request. When exposing BitPlay to the internet, place it behind HTTPS (for example Caddy, Nginx, or Traefik with TLS).
+
 ## Configuration
 
 BitPlay is configured primarily through its web interface after starting the application.
@@ -107,19 +141,20 @@ BitPlay is configured primarily through its web interface after starting the app
     *   **Prowlarr:** Enable/disable Prowlarr, provide the Prowlarr Host URL (e.g., `http://prowlarr:9696`), and your Prowlarr API Key. Test the connection.
     *   **Jackett:** Enable/disable Jackett, provide the Jackett Host URL (e.g., `http://jackett:9117`), and your Jackett API Key. Test the connection.
 
-Settings are saved automatically to `/app/config/settings.json` inside the Docker container, which maps to `./config/settings.json` on the host via the mounted volume in the example Docker Compose setup above.
+Settings are saved automatically to `/app/config/settings.json` and saved torrents are stored in `/app/config/torrents.db` inside the Docker container. With the mounted volume, these map to `./config/settings.json` and `./config/torrents.db` on the host.
 
 ## Usage
 
 1.  **Configure Settings:** Set up your proxy and search providers (Prowlarr/Jackett) as described above.
 2.  **Search:** Use the search bar to query Prowlarr or Jackett for torrents.
 3.  **Add Torrent:** Paste a magnet link directly or click a search result to add the torrent to BitPlay.
+4.  **Reopen Saved Torrents:** Use the **Saved Torrents** dropdown in the UI to reopen previously added torrents without redoing metadata preprocessing.
 
     > BitPlay also supports opening from another app/program by providing torrent or magnet link as query parameter `torrent`. The link needs to be URL-encoded! 
     >
     > Ex: `http://localhost:3347?torrent=magnet%3A%3Fxt%3Durn%3Abtih%3A08ada5a7a6183aae1e09d831df6748d566095a10%26dn%3DSintel%26tr%3Dudp%253A%252F%252Fexplodie.org%253A6969%26tr%3Dudp%253A%252F%252Ftracker.coppersurfer.tk%253A6969%26tr%3Dudp%253A%252F%252Ftracker.empire-js.us%253A1337%26tr%3Dudp%253A%252F%252Ftracker.leechers-paradise.org%253A6969%26tr%3Dudp%253A%252F%252Ftracker.opentrackr.org%253A1337%26tr%3Dwss%253A%252F%252Ftracker.btorrent.xyz%26tr%3Dwss%253A%252F%252Ftracker.fastcast.nz%26tr%3Dwss%253A%252F%252Ftracker.openwebtorrent.com%26ws%3Dhttps%253A%252F%252Fwebtorrent.io%252Ftorrents%252F%26xs%3Dhttps%253A%252F%252Fwebtorrent.io%252Ftorrents%252Fsintel.torrent`
 
-4.  **Stream:** Once the torrent info is loaded, select the video file you want to watch. BitPlay will start downloading and streaming it directly in the built-in player.
+5.  **Stream:** Once the torrent info is loaded, select the video file you want to watch. BitPlay will start downloading and streaming it directly in the built-in player.
 
 ## Contributing
 

@@ -1,0 +1,15 @@
+services:
+  bitplay:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: bitplay:local
+    container_name: bitplay
+    ports:
+      - 3347:3347 # Expose the web UI port
+    env_file:
+      - .env
+    volumes:
+      # Mount the config directory for persistent settings (Optional)
+      - ./config:/app/config
+    restart: unless-stopped
