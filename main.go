@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base32"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -17,12 +18,15 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"reflect"
 	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"net/url"
@@ -45,6 +49,12 @@ type TorrentSession struct {
 	Torrent  *torrent.Torrent
 	Port     int
 	LastUsed time.Time
+
+	statsMu              sync.Mutex
+	lastStatsAt          time.Time
+	lastBytesReadData    int64
+	lastBytesReadUseful  int64
+	lastBytesWrittenData int64
 }
 
 type Settings struct {
@@ -100,6 +110,32 @@ type StoredTorrentView struct {
 	LastUsedAt time.Time           `json:"lastUsedAt"`
 }
 
+type TorrentDiagnosticsResponse struct {
+	SessionID             string    `json:"sessionId"`
+	TorrentName           string    `json:"torrentName"`
+	TorrentLengthBytes    int64     `json:"torrentLengthBytes"`
+	BytesCompleted        int64     `json:"bytesCompleted"`
+	BytesMissing          int64     `json:"bytesMissing"`
+	Progress              float64   `json:"progress"`
+	TotalPeers            int       `json:"totalPeers"`
+	PendingPeers          int       `json:"pendingPeers"`
+	ActivePeers           int       `json:"activePeers"`
+	ConnectedSeeders      int       `json:"connectedSeeders"`
+	HalfOpenPeers         int       `json:"halfOpenPeers"`
+	PiecesComplete        int       `json:"piecesComplete"`
+	DownloadedDataBytes   int64     `json:"downloadedDataBytes"`
+	DownloadedUsefulBytes int64     `json:"downloadedUsefulBytes"`
+	UploadedDataBytes     int64     `json:"uploadedDataBytes"`
+	DownloadRateBps       float64   `json:"downloadRateBps"`
+	UsefulDownloadRateBps float64   `json:"usefulDownloadRateBps"`
+	UploadRateBps         float64   `json:"uploadRateBps"`
+	StoragePath           string    `json:"storagePath,omitempty"`
+	StorageTotalBytes     uint64    `json:"storageTotalBytes,omitempty"`
+	StorageFreeBytes      uint64    `json:"storageFreeBytes,omitempty"`
+	StorageDiagnosticsErr string    `json:"storageDiagnosticsErr,omitempty"`
+	Timestamp             time.Time `json:"timestamp"`
+}
+
 type BasicAuthConfig struct {
 	Enabled  bool
 	Username string
@@ -107,10 +143,112 @@ type BasicAuthConfig struct {
 	Realm    string
 }
 
+type loggingResponseWriter struct {
+	http.ResponseWriter
+	statusCode int
+	bytes      int
+}
+
+type contextKey string
+
+const requestIDContextKey contextKey = "request_id"
+
+const (
+	defaultPlayerDiagnosticsLogPath    = "/tmp/bitplay-player-diagnostics.ndjson"
+	defaultTorrentStoragePath          = "./torrent-data"
+	maxPlayerDiagnosticsPayloadBytes   = 512 * 1024
+	defaultPlayerDiagnosticsReadLimit  = 200
+	maxPlayerDiagnosticsReadLimit      = 2000
+	videoStreamReadaheadBytes          = 64 * 1024 * 1024
+	defaultFFmpegBinary                = "ffmpeg"
+	defaultFFprobeBinary               = "ffprobe"
+	transcodeStartupMinContiguousBytes = 2 * 1024 * 1024
+	transcodeStartupWaitTimeout        = 20 * time.Second
+	transcodeStartupPollInterval       = 250 * time.Millisecond
+	transcodeDurationProbeTimeout      = 6 * time.Second
+	transcodeDurationProbeMaxBytes     = 32 * 1024 * 1024
+	transcodeDurationProbeRetryDelay   = 20 * time.Second
+)
+
+func (w *loggingResponseWriter) WriteHeader(statusCode int) {
+	w.statusCode = statusCode
+	w.ResponseWriter.WriteHeader(statusCode)
+}
+
+func (w *loggingResponseWriter) Write(b []byte) (int, error) {
+	if w.statusCode == 0 {
+		w.statusCode = http.StatusOK
+	}
+	n, err := w.ResponseWriter.Write(b)
+	w.bytes += n
+	return n, err
+}
+
+func requestIDFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	requestID, _ := ctx.Value(requestIDContextKey).(string)
+	return requestID
+}
+
+func newRequestID() string {
+	return fmt.Sprintf("req-%08x", requestSeq.Add(1))
+}
+
+func summarizeIDs(ids []string, limit int) string {
+	if len(ids) == 0 {
+		return "[]"
+	}
+
+	sort.Strings(ids)
+	if limit <= 0 || len(ids) <= limit {
+		return "[" + strings.Join(ids, ", ") + "]"
+	}
+
+	return fmt.Sprintf("[%s, ... (+%d more)]", strings.Join(ids[:limit], ", "), len(ids)-limit)
+}
+
+func inMemorySessionIDs() []string {
+	ids := make([]string, 0)
+	sessions.Range(func(key, _ interface{}) bool {
+		id := normalizeTorrentID(fmt.Sprintf("%v", key))
+		if id != "" {
+			ids = append(ids, id)
+		}
+		return true
+	})
+	return ids
+}
+
+func storedTorrentIDs() ([]string, error) {
+	records, err := listStoredTorrents()
+	if err != nil {
+		return nil, err
+	}
+
+	return extractStoredTorrentIDs(records), nil
+}
+
+func extractStoredTorrentIDs(records []StoredTorrent) []string {
+	ids := make([]string, 0, len(records))
+	for _, record := range records {
+		id := normalizeTorrentID(record.ID)
+		if id != "" {
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
 var (
-	sessions  sync.Map
-	usedPorts sync.Map
-	portMutex sync.Mutex
+	sessions                sync.Map
+	usedPorts               sync.Map
+	portMutex               sync.Mutex
+	requestSeq              atomic.Uint64
+	playerDiagnosticsFileMu sync.Mutex
+	transcodeDurationHints  sync.Map
+	transcodeDurationProbes sync.Map
 
 	torrentDB *bolt.DB
 )
@@ -135,6 +273,203 @@ func formatSize(sizeInBytes float64) string {
 
 	sizeInGB := sizeInMB / 1024
 	return fmt.Sprintf("%.2f GB", sizeInGB)
+}
+
+func nonNegativeDelta(current, previous int64) int64 {
+	if current <= previous {
+		return 0
+	}
+	return current - previous
+}
+
+func readStorageDiagnostics(path string) (totalBytes uint64, freeBytes uint64, err error) {
+	var stats syscall.Statfs_t
+	if err := syscall.Statfs(path, &stats); err != nil {
+		return 0, 0, err
+	}
+	blockSize := uint64(stats.Bsize)
+	totalBytes = stats.Blocks * blockSize
+	freeBytes = stats.Bavail * blockSize
+	return totalBytes, freeBytes, nil
+}
+
+func buildTorrentDiagnostics(sessionID string, session *TorrentSession) TorrentDiagnosticsResponse {
+	stats := session.Torrent.Stats()
+	now := time.Now()
+
+	bytesReadData := stats.BytesReadData.Int64()
+	bytesReadUseful := stats.BytesReadUsefulData.Int64()
+	bytesWrittenData := stats.BytesWrittenData.Int64()
+
+	var downloadRateBps float64
+	var usefulDownloadRateBps float64
+	var uploadRateBps float64
+
+	session.statsMu.Lock()
+	if !session.lastStatsAt.IsZero() {
+		elapsed := now.Sub(session.lastStatsAt).Seconds()
+		if elapsed > 0 {
+			downloadRateBps = float64(nonNegativeDelta(bytesReadData, session.lastBytesReadData)) / elapsed
+			usefulDownloadRateBps = float64(nonNegativeDelta(bytesReadUseful, session.lastBytesReadUseful)) / elapsed
+			uploadRateBps = float64(nonNegativeDelta(bytesWrittenData, session.lastBytesWrittenData)) / elapsed
+		}
+	}
+	session.lastStatsAt = now
+	session.lastBytesReadData = bytesReadData
+	session.lastBytesReadUseful = bytesReadUseful
+	session.lastBytesWrittenData = bytesWrittenData
+	session.statsMu.Unlock()
+
+	length := session.Torrent.Length()
+	completed := session.Torrent.BytesCompleted()
+	missing := session.Torrent.BytesMissing()
+	progress := 0.0
+	if length > 0 {
+		progress = (float64(completed) / float64(length)) * 100
+	}
+
+	storagePath := defaultTorrentStoragePath
+	storageTotal, storageFree, storageErr := readStorageDiagnostics(storagePath)
+	storageErrText := ""
+	if storageErr != nil {
+		storageErrText = storageErr.Error()
+	}
+
+	return TorrentDiagnosticsResponse{
+		SessionID:             sessionID,
+		TorrentName:           session.Torrent.Name(),
+		TorrentLengthBytes:    length,
+		BytesCompleted:        completed,
+		BytesMissing:          missing,
+		Progress:              progress,
+		TotalPeers:            stats.TotalPeers,
+		PendingPeers:          stats.PendingPeers,
+		ActivePeers:           stats.ActivePeers,
+		ConnectedSeeders:      stats.ConnectedSeeders,
+		HalfOpenPeers:         stats.HalfOpenPeers,
+		PiecesComplete:        stats.PiecesComplete,
+		DownloadedDataBytes:   bytesReadData,
+		DownloadedUsefulBytes: bytesReadUseful,
+		UploadedDataBytes:     bytesWrittenData,
+		DownloadRateBps:       downloadRateBps,
+		UsefulDownloadRateBps: usefulDownloadRateBps,
+		UploadRateBps:         uploadRateBps,
+		StoragePath:           storagePath,
+		StorageTotalBytes:     storageTotal,
+		StorageFreeBytes:      storageFree,
+		StorageDiagnosticsErr: storageErrText,
+		Timestamp:             now,
+	}
+}
+
+func resolvePlayerDiagnosticsLogPath() string {
+	if configuredPath := strings.TrimSpace(os.Getenv("BITPLAY_PLAYER_DIAGNOSTICS_LOG")); configuredPath != "" {
+		return configuredPath
+	}
+	return defaultPlayerDiagnosticsLogPath
+}
+
+func appendPlayerDiagnosticsLine(logPath string, line []byte) error {
+	playerDiagnosticsFileMu.Lock()
+	defer playerDiagnosticsFileMu.Unlock()
+
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
+		return err
+	}
+
+	file, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	if _, err := file.Write(line); err != nil {
+		return err
+	}
+	_, err = file.Write([]byte("\n"))
+	return err
+}
+
+func readRecentPlayerDiagnosticsLines(logPath string, limit int, sessionID string) ([]string, error) {
+	playerDiagnosticsFileMu.Lock()
+	defer playerDiagnosticsFileMu.Unlock()
+
+	file, err := os.Open(logPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []string{}, nil
+		}
+		return nil, err
+	}
+	defer file.Close()
+
+	filterToken := ""
+	if sessionID != "" {
+		filterToken = `"sessionId":"` + sessionID + `"`
+	}
+
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 0, 64*1024), 2*1024*1024)
+
+	lines := make([]string, 0, limit)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if filterToken != "" && !strings.Contains(line, filterToken) {
+			continue
+		}
+
+		if len(lines) == limit {
+			copy(lines, lines[1:])
+			lines[len(lines)-1] = line
+			continue
+		}
+		lines = append(lines, line)
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return lines, nil
+}
+
+func isVideoExtension(ext string) bool {
+	switch strings.ToLower(strings.TrimSpace(ext)) {
+	case ".mp4", ".m4v", ".mkv", ".webm", ".avi":
+		return true
+	default:
+		return false
+	}
+}
+
+type fileProgressSnapshot struct {
+	TotalBytes      int64
+	CompletedBytes  int64
+	ContiguousBytes int64
+	PiecesTotal     int
+	PiecesComplete  int
+}
+
+func buildFileProgressSnapshot(file *torrent.File) fileProgressSnapshot {
+	snapshot := fileProgressSnapshot{
+		TotalBytes: file.Length(),
+	}
+
+	states := file.State()
+	contiguous := true
+	for _, piece := range states {
+		snapshot.PiecesTotal++
+		if piece.Complete {
+			snapshot.PiecesComplete++
+			snapshot.CompletedBytes += piece.Bytes
+			if contiguous {
+				snapshot.ContiguousBytes += piece.Bytes
+			}
+			continue
+		}
+		contiguous = false
+	}
+
+	return snapshot
 }
 
 var (
@@ -619,6 +954,496 @@ func toStoredTorrentView(record StoredTorrent) StoredTorrentView {
 	}
 }
 
+func parseFileIndex(fileIndexPathPart string, maxFiles int) (int, error) {
+	fileIndexString := strings.TrimSuffix(fileIndexPathPart, ".vtt")
+	fileIndex, err := strconv.Atoi(fileIndexString)
+	if err != nil {
+		return 0, errors.New("invalid file index")
+	}
+
+	if fileIndex < 0 || fileIndex >= maxFiles {
+		return 0, errors.New("file index out of range")
+	}
+
+	return fileIndex, nil
+}
+
+func parseStartSeconds(raw string) (float64, error) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return 0, nil
+	}
+
+	start, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		return 0, errors.New("invalid start parameter")
+	}
+	if start < 0 {
+		return 0, errors.New("start must be greater than or equal to 0")
+	}
+
+	return start, nil
+}
+
+func resolveFFmpegBinary() string {
+	if configured := strings.TrimSpace(os.Getenv("BITPLAY_FFMPEG_BIN")); configured != "" {
+		return configured
+	}
+	return defaultFFmpegBinary
+}
+
+func resolveFFprobeBinary() string {
+	if configured := strings.TrimSpace(os.Getenv("BITPLAY_FFPROBE_BIN")); configured != "" {
+		return configured
+	}
+	return defaultFFprobeBinary
+}
+
+func resolveInternalBasicAuthHeader() string {
+	username := os.Getenv("BITPLAY_AUTH_USERNAME")
+	password := os.Getenv("BITPLAY_AUTH_PASSWORD")
+	if username == "" || password == "" {
+		return ""
+	}
+
+	token := base64.StdEncoding.EncodeToString([]byte(username + ":" + password))
+	return "Authorization: Basic " + token + "\r\n"
+}
+
+func sanitizeFFmpegArgs(args []string) []string {
+	if len(args) == 0 {
+		return args
+	}
+
+	out := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		out = append(out, args[i])
+		if args[i] == "-headers" && i+1 < len(args) {
+			out = append(out, "<redacted>")
+			i++
+		}
+	}
+	return out
+}
+
+func parseDurationSeconds(raw string) float64 {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return 0
+	}
+
+	seconds, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		return 0
+	}
+	if seconds <= 0 {
+		return 0
+	}
+	if seconds > 7*24*60*60 {
+		return 0
+	}
+	return seconds
+}
+
+func extractDurationFromFFprobePayload(payload []byte) float64 {
+	if len(bytes.TrimSpace(payload)) == 0 {
+		return 0
+	}
+
+	type ffprobeStream struct {
+		CodecType string `json:"codec_type"`
+		Duration  string `json:"duration"`
+	}
+	type ffprobeFormat struct {
+		Duration string `json:"duration"`
+	}
+	type ffprobeResult struct {
+		Format  ffprobeFormat   `json:"format"`
+		Streams []ffprobeStream `json:"streams"`
+	}
+
+	var result ffprobeResult
+	if err := json.Unmarshal(payload, &result); err != nil {
+		return 0
+	}
+
+	if formatDuration := parseDurationSeconds(result.Format.Duration); formatDuration > 0 {
+		return formatDuration
+	}
+
+	videoDuration := 0.0
+	maxDuration := 0.0
+	for _, stream := range result.Streams {
+		streamDuration := parseDurationSeconds(stream.Duration)
+		if streamDuration <= 0 {
+			continue
+		}
+		if streamDuration > maxDuration {
+			maxDuration = streamDuration
+		}
+		if stream.CodecType == "video" && streamDuration > videoDuration {
+			videoDuration = streamDuration
+		}
+	}
+	if videoDuration > 0 {
+		return videoDuration
+	}
+	return maxDuration
+}
+
+func probeVideoDurationSeconds(reqID string, sessionID string, fileIndex int, file *torrent.File, fileName string) (float64, error) {
+	ffprobeBinary := resolveFFprobeBinary()
+	if _, err := exec.LookPath(ffprobeBinary); err != nil {
+		return 0, fmt.Errorf("ffprobe not available: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), transcodeDurationProbeTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(
+		ctx,
+		ffprobeBinary,
+		"-v", "error",
+		"-print_format", "json",
+		"-show_entries", "format=duration:stream=codec_type,duration",
+		"-i", "pipe:0",
+	)
+
+	stdinPipe, err := cmd.StdinPipe()
+	if err != nil {
+		return 0, fmt.Errorf("ffprobe stdin pipe: %w", err)
+	}
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		return 0, fmt.Errorf("ffprobe stdout pipe: %w", err)
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	if err := cmd.Start(); err != nil {
+		return 0, fmt.Errorf("ffprobe start: %w", err)
+	}
+
+	reader := file.NewReader()
+	reader.SetResponsive()
+	reader.SetReadahead(videoStreamReadaheadBytes)
+	defer func() {
+		if closer, ok := reader.(io.Closer); ok {
+			closer.Close()
+		}
+	}()
+
+	copyDone := make(chan struct{})
+	var copyErr error
+	go func() {
+		defer close(copyDone)
+		_, copyErr = io.Copy(stdinPipe, io.LimitReader(reader, transcodeDurationProbeMaxBytes))
+		_ = stdinPipe.Close()
+	}()
+
+	ffprobeOutput, readErr := io.ReadAll(stdoutPipe)
+	<-copyDone
+	waitErr := cmd.Wait()
+
+	if readErr != nil && !errors.Is(readErr, context.Canceled) {
+		return 0, fmt.Errorf("ffprobe read output: %w", readErr)
+	}
+	if waitErr != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return 0, fmt.Errorf("ffprobe timeout after %s", transcodeDurationProbeTimeout)
+		}
+		return 0, fmt.Errorf("ffprobe wait: %w stderr=%q", waitErr, strings.TrimSpace(stderr.String()))
+	}
+	if copyErr != nil &&
+		!errors.Is(copyErr, context.Canceled) &&
+		!errors.Is(copyErr, io.ErrClosedPipe) &&
+		!errors.Is(copyErr, syscall.EPIPE) {
+		log.Printf(
+			"[torrent-handler] req=%s transcode duration probe input copy warning session=%s file_index=%d file=%q err=%v",
+			reqID,
+			sessionID,
+			fileIndex,
+			fileName,
+			copyErr,
+		)
+	}
+
+	durationSeconds := extractDurationFromFFprobePayload(ffprobeOutput)
+	if durationSeconds <= 0 {
+		return 0, fmt.Errorf("duration unavailable")
+	}
+	return durationSeconds, nil
+}
+
+type transcodeDurationHintEntry struct {
+	DurationSeconds float64
+	CheckedAt       time.Time
+}
+
+func transcodeDurationHintCacheKey(sessionID string, fileIndex int) string {
+	return sessionID + ":" + strconv.Itoa(fileIndex)
+}
+
+func resolveTranscodeDurationHint(
+	reqID string,
+	sessionID string,
+	fileIndex int,
+	file *torrent.File,
+	fileName string,
+	syncProbe bool,
+) float64 {
+	cacheKey := transcodeDurationHintCacheKey(sessionID, fileIndex)
+	now := time.Now()
+
+	if cached, ok := transcodeDurationHints.Load(cacheKey); ok {
+		entry := cached.(transcodeDurationHintEntry)
+		if entry.DurationSeconds > 0 {
+			return entry.DurationSeconds
+		}
+		if now.Sub(entry.CheckedAt) < transcodeDurationProbeRetryDelay {
+			return 0
+		}
+	}
+
+	probeAndStore := func() float64 {
+		startedAt := time.Now()
+		durationSeconds, err := probeVideoDurationSeconds(reqID, sessionID, fileIndex, file, fileName)
+		if err != nil {
+			log.Printf(
+				"[torrent-handler] req=%s transcode duration probe failed session=%s file_index=%d file=%q err=%v",
+				reqID,
+				sessionID,
+				fileIndex,
+				fileName,
+				err,
+			)
+			transcodeDurationHints.Store(cacheKey, transcodeDurationHintEntry{
+				DurationSeconds: 0,
+				CheckedAt:       time.Now(),
+			})
+			return 0
+		}
+
+		transcodeDurationHints.Store(cacheKey, transcodeDurationHintEntry{
+			DurationSeconds: durationSeconds,
+			CheckedAt:       time.Now(),
+		})
+
+		log.Printf(
+			"[torrent-handler] req=%s transcode duration probe success session=%s file_index=%d file=%q duration_seconds=%.3f elapsed_ms=%d",
+			reqID,
+			sessionID,
+			fileIndex,
+			fileName,
+			durationSeconds,
+			time.Since(startedAt).Milliseconds(),
+		)
+		return durationSeconds
+	}
+
+	if syncProbe {
+		return probeAndStore()
+	}
+
+	if _, loaded := transcodeDurationProbes.LoadOrStore(cacheKey, struct{}{}); !loaded {
+		go func() {
+			defer transcodeDurationProbes.Delete(cacheKey)
+			probeAndStore()
+		}()
+	}
+	return 0
+}
+
+func streamTranscodedVideo(
+	w http.ResponseWriter,
+	r *http.Request,
+	reqID string,
+	sessionID string,
+	fileIndex int,
+	file *torrent.File,
+	fileName string,
+	startSeconds float64,
+	durationHintSeconds float64,
+) {
+	ffmpegBinary := resolveFFmpegBinary()
+	if _, err := exec.LookPath(ffmpegBinary); err != nil {
+		log.Printf("[torrent-handler] req=%s transcode unavailable ffmpeg=%q err=%v", reqID, ffmpegBinary, err)
+		respondWithJSON(w, http.StatusServiceUnavailable, map[string]string{
+			"error": "Compatibility transcoding is unavailable: ffmpeg is not installed",
+		})
+		return
+	}
+
+	w.Header().Set("Content-Type", "video/mp4")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Accept-Ranges", "none")
+	w.Header().Set("X-BitPlay-Transcode", "ffmpeg")
+	w.Header().Set("X-BitPlay-Reader-Mode", "responsive")
+	w.Header().Set("X-BitPlay-Stream-Readahead", strconv.FormatInt(videoStreamReadaheadBytes, 10))
+	if durationHintSeconds > 0 {
+		w.Header().Set("X-BitPlay-Duration-Seconds", fmt.Sprintf("%.3f", durationHintSeconds))
+	}
+
+	if r.Method == http.MethodHead {
+		return
+	}
+
+	args := []string{
+		"-hide_banner",
+		"-loglevel", "error",
+		"-nostdin",
+		"-fflags", "+genpts+nobuffer",
+		"-analyzeduration", "2M",
+		"-probesize", "2M",
+	}
+
+	inputMode := "pipe"
+	inputTarget := "pipe:0"
+	usePipeInput := true
+
+	if startSeconds > 0 {
+		inputMode = "http-seekable-stream"
+		usePipeInput = false
+		inputTarget = fmt.Sprintf(
+			"http://127.0.0.1:3347/api/v1/torrent/%s/stream/%d",
+			sessionID,
+			fileIndex,
+		)
+
+		args = append(args, "-ss", fmt.Sprintf("%.3f", startSeconds))
+		if authHeader := resolveInternalBasicAuthHeader(); authHeader != "" {
+			args = append(args, "-headers", authHeader)
+		}
+		args = append(args,
+			"-rw_timeout", "20000000",
+			"-seekable", "1",
+			"-i", inputTarget,
+		)
+	} else {
+		args = append(args, "-i", inputTarget)
+	}
+
+	args = append(args,
+		"-map", "0:v:0",
+		"-map", "0:a:0?",
+		"-c:v", "libx264",
+		"-preset", "veryfast",
+		"-tune", "zerolatency",
+		"-profile:v", "main",
+		"-level", "4.0",
+		"-x264-params", "keyint=48:min-keyint=48:scenecut=0",
+		"-pix_fmt", "yuv420p",
+		"-c:a", "aac",
+		"-ac", "2",
+		"-b:a", "160k",
+		"-muxdelay", "0",
+		"-muxpreload", "0",
+		"-movflags", "frag_keyframe+empty_moov+default_base_moof",
+		"-f", "mp4",
+		"pipe:1",
+	)
+
+	log.Printf(
+		"[torrent-handler] req=%s transcode start session=%s file_index=%d file=%q start_seconds=%.3f ffmpeg=%q args=%q",
+		reqID,
+		sessionID,
+		fileIndex,
+		fileName,
+		startSeconds,
+		ffmpegBinary,
+		strings.Join(sanitizeFFmpegArgs(args), " "),
+	)
+
+	cmd := exec.CommandContext(r.Context(), ffmpegBinary, args...)
+
+	var reader io.Reader
+	var readerCloser io.Closer
+	var stdinPipe io.WriteCloser
+	var err error
+	if usePipeInput {
+		fileReader := file.NewReader()
+		fileReader.SetResponsive()
+		fileReader.SetReadahead(videoStreamReadaheadBytes)
+		reader = fileReader
+		if closer, ok := any(fileReader).(io.Closer); ok {
+			readerCloser = closer
+		}
+		stdinPipe, err = cmd.StdinPipe()
+		if err != nil {
+			if readerCloser != nil {
+				readerCloser.Close()
+			}
+			log.Printf("[torrent-handler] req=%s transcode stdin pipe error: %v", reqID, err)
+			http.Error(w, "Failed to initialize transcoder input", http.StatusInternalServerError)
+			return
+		}
+		defer func() {
+			if readerCloser != nil {
+				readerCloser.Close()
+			}
+		}()
+	}
+
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		log.Printf("[torrent-handler] req=%s transcode stdout pipe error: %v", reqID, err)
+		http.Error(w, "Failed to initialize transcoder output", http.StatusInternalServerError)
+		return
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	if err := cmd.Start(); err != nil {
+		log.Printf("[torrent-handler] req=%s transcode start error: %v", reqID, err)
+		http.Error(w, "Failed to start transcoder", http.StatusBadGateway)
+		return
+	}
+
+	copyInputDone := make(chan struct{})
+	var copyInputErr error
+	if usePipeInput {
+		go func() {
+			defer close(copyInputDone)
+			_, copyInputErr = io.Copy(stdinPipe, reader)
+			_ = stdinPipe.Close()
+		}()
+	} else {
+		close(copyInputDone)
+	}
+
+	_, copyOutputErr := io.Copy(w, stdoutPipe)
+	<-copyInputDone
+	waitErr := cmd.Wait()
+
+	if usePipeInput && copyInputErr != nil && !errors.Is(copyInputErr, context.Canceled) {
+		log.Printf("[torrent-handler] req=%s transcode input copy error mode=%s: %v", reqID, inputMode, copyInputErr)
+	}
+
+	if copyOutputErr != nil && !errors.Is(copyOutputErr, context.Canceled) {
+		log.Printf("[torrent-handler] req=%s transcode output copy error mode=%s: %v", reqID, inputMode, copyOutputErr)
+	}
+
+	if waitErr != nil && !errors.Is(waitErr, context.Canceled) {
+		log.Printf(
+			"[torrent-handler] req=%s transcode process error mode=%s input=%q: %v stderr=%q",
+			reqID,
+			inputMode,
+			inputTarget,
+			waitErr,
+			strings.TrimSpace(stderr.String()),
+		)
+		return
+	}
+
+	log.Printf(
+		"[torrent-handler] req=%s transcode complete session=%s file_index=%d file=%q",
+		reqID,
+		sessionID,
+		fileIndex,
+		fileName,
+	)
+}
+
 func loadDotEnvFile(path string) error {
 	file, err := os.Open(path)
 	if err != nil {
@@ -716,6 +1541,13 @@ func withBasicAuth(next http.Handler, cfg BasicAuthConfig) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		username, password, ok := r.BasicAuth()
 		if !ok || !secureStringEqual(username, cfg.Username) || !secureStringEqual(password, cfg.Password) {
+			log.Printf(
+				"[auth] unauthorized req=%s path=%s remote=%s user=%q",
+				requestIDFromContext(r.Context()),
+				r.URL.Path,
+				r.RemoteAddr,
+				username,
+			)
 			w.Header().Set("WWW-Authenticate", challenge)
 			if strings.HasPrefix(r.URL.Path, "/api/") {
 				respondWithJSON(w, http.StatusUnauthorized, map[string]string{"error": "Unauthorized"})
@@ -726,6 +1558,41 @@ func withBasicAuth(next http.Handler, cfg BasicAuthConfig) http.Handler {
 		}
 
 		next.ServeHTTP(w, r)
+	})
+}
+
+func withRequestLogging(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqID := newRequestID()
+		r = r.WithContext(context.WithValue(r.Context(), requestIDContextKey, reqID))
+		start := time.Now()
+		lrw := &loggingResponseWriter{ResponseWriter: w}
+		lrw.Header().Set("X-Request-Id", reqID)
+
+		next.ServeHTTP(lrw, r)
+
+		if lrw.statusCode == 0 {
+			lrw.statusCode = http.StatusOK
+		}
+
+		userAgent := r.UserAgent()
+		if len(userAgent) > 180 {
+			userAgent = userAgent[:180] + "..."
+		}
+
+		log.Printf(
+			"[http] req=%s method=%s path=%s status=%d bytes=%d dur_ms=%d remote=%s range=%q referer=%q ua=%q",
+			reqID,
+			r.Method,
+			r.URL.Path,
+			lrw.statusCode,
+			lrw.bytes,
+			time.Since(start).Milliseconds(),
+			r.RemoteAddr,
+			r.Header.Get("Range"),
+			r.Referer(),
+			userAgent,
+		)
 	})
 }
 
@@ -753,6 +1620,7 @@ func main() {
 	appMux.HandleFunc("/api/v1/torrent/add", addTorrentHandler)
 	appMux.HandleFunc("/api/v1/torrent/", torrentHandler)
 	appMux.HandleFunc("/api/v1/torrents", listSavedTorrentsHandler)
+	appMux.HandleFunc("/api/v1/player-diagnostics", playerDiagnosticsHandler)
 	appMux.HandleFunc("/api/v1/settings", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet {
 			settingsMutex.RLock()
@@ -794,7 +1662,7 @@ func main() {
 	// Create a server with graceful shutdown
 	server := &http.Server{
 		Addr:    addr,
-		Handler: withBasicAuth(appMux, authConfig),
+		Handler: withRequestLogging(withBasicAuth(appMux, authConfig)),
 	}
 
 	// Start the server in a goroutine
@@ -908,6 +1776,7 @@ func waitForTorrentInfo(t *torrent.Torrent, timeout time.Duration) error {
 }
 
 func createSessionFromMagnet(magnet string) (string, error) {
+	log.Printf("[torrent-session] create from magnet start hash=%s", extractInfoHashFromMagnet(magnet))
 	client, port, err := initTorrentWithProxy()
 	if err != nil {
 		return "", fmt.Errorf("failed to create client with proxy: %w", err)
@@ -924,8 +1793,10 @@ func createSessionFromMagnet(magnet string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("invalid magnet url: %w", err)
 	}
+	log.Printf("[torrent-session] magnet added pending info hash=%s", t.InfoHash().HexString())
 
 	if err := waitForTorrentInfo(t, 3*time.Minute); err != nil {
+		log.Printf("[torrent-session] got-info timeout/failure hash=%s err=%v", t.InfoHash().HexString(), err)
 		return "", err
 	}
 
@@ -942,11 +1813,18 @@ func createSessionFromMagnet(magnet string) (string, error) {
 	if err := storeTorrentRecord(record); err != nil {
 		log.Printf("Warning: failed to persist torrent %s: %v", sessionID, err)
 	}
+	log.Printf("[torrent-session] created from magnet session=%s files=%d", sessionID, len(t.Files()))
 
 	return sessionID, nil
 }
 
 func createSessionFromRecord(record *StoredTorrent) (string, error) {
+	log.Printf(
+		"[torrent-session] restore from record start id=%s has_metainfo=%t files_cached=%d",
+		record.ID,
+		len(record.MetaInfo) > 0,
+		len(record.Files),
+	)
 	client, port, err := initTorrentWithProxy()
 	if err != nil {
 		return "", fmt.Errorf("failed to create client with proxy: %w", err)
@@ -965,6 +1843,8 @@ func createSessionFromRecord(record *StoredTorrent) (string, error) {
 			t, err = client.AddTorrent(mi)
 			if err != nil {
 				log.Printf("Warning: failed to add torrent from cached metainfo for %s: %v", record.ID, err)
+			} else {
+				log.Printf("[torrent-session] restored via cached metainfo id=%s", record.ID)
 			}
 		} else {
 			log.Printf("Warning: failed to parse cached metainfo for %s: %v", record.ID, err)
@@ -979,9 +1859,11 @@ func createSessionFromRecord(record *StoredTorrent) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("failed to restore magnet session: %w", err)
 		}
+		log.Printf("[torrent-session] fallback restored via magnet id=%s", record.ID)
 	}
 
 	if err := waitForTorrentInfo(t, 3*time.Minute); err != nil {
+		log.Printf("[torrent-session] restore got-info timeout/failure id=%s err=%v", record.ID, err)
 		return "", err
 	}
 
@@ -999,6 +1881,7 @@ func createSessionFromRecord(record *StoredTorrent) (string, error) {
 	if err := storeTorrentRecord(updatedRecord); err != nil {
 		log.Printf("Warning: failed to refresh stored torrent %s: %v", sessionID, err)
 	}
+	log.Printf("[torrent-session] restore done id=%s files=%d", sessionID, len(t.Files()))
 
 	return sessionID, nil
 }
@@ -1013,20 +1896,37 @@ func ensureTorrentSession(sessionID string) (*TorrentSession, error) {
 		session := value.(*TorrentSession)
 		session.LastUsed = time.Now()
 		markStoredTorrentUsed(sessionID)
+		log.Printf("[torrent-session] cache hit id=%s", sessionID)
 		return session, nil
 	}
+	log.Printf("[torrent-session] cache miss id=%s; trying persistent store", sessionID)
 
 	record, err := getStoredTorrent(sessionID)
 	if err != nil {
 		return nil, err
 	}
 	if record == nil {
+		inMemorySummary := summarizeIDs(inMemorySessionIDs(), 8)
+		storedIDs, storedErr := storedTorrentIDs()
+		storedSummary := summarizeIDs(storedIDs, 8)
+		if storedErr != nil {
+			storedSummary = fmt.Sprintf("error loading stored ids: %v", storedErr)
+		}
+		log.Printf(
+			"[torrent-session] not found in persistent store id=%s known_in_memory=%s known_stored=%s",
+			sessionID,
+			inMemorySummary,
+			storedSummary,
+		)
 		return nil, errors.New("torrent not found")
 	}
 
 	restoredID, err := createSessionFromRecord(record)
 	if err != nil {
 		return nil, err
+	}
+	if restoredID != sessionID {
+		log.Printf("[torrent-session] restore id mismatch requested=%s restored=%s", sessionID, restoredID)
 	}
 
 	value, ok := sessions.Load(restoredID)
@@ -1037,6 +1937,7 @@ func ensureTorrentSession(sessionID string) (*TorrentSession, error) {
 	session := value.(*TorrentSession)
 	session.LastUsed = time.Now()
 	markStoredTorrentUsed(restoredID)
+	log.Printf("[torrent-session] restored into memory id=%s", restoredID)
 	return session, nil
 }
 
@@ -1046,6 +1947,7 @@ func getOrCreateSessionByMagnet(magnet string) (string, error) {
 			session := value.(*TorrentSession)
 			session.LastUsed = time.Now()
 			markStoredTorrentUsed(infoHash)
+			log.Printf("[torrent-session] reuse in-memory by magnet hash=%s", infoHash)
 			return infoHash, nil
 		}
 
@@ -1054,10 +1956,13 @@ func getOrCreateSessionByMagnet(magnet string) (string, error) {
 			return "", err
 		}
 		if record != nil {
+			log.Printf("[torrent-session] reuse persistent by magnet hash=%s", infoHash)
 			return createSessionFromRecord(record)
 		}
+		log.Printf("[torrent-session] no cached entry for magnet hash=%s; creating new", infoHash)
 	}
 
+	log.Printf("[torrent-session] create new session (no parsed hash)")
 	return createSessionFromMagnet(magnet)
 }
 
@@ -1066,13 +1971,15 @@ func listSavedTorrentsHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	reqID := requestIDFromContext(r.Context())
 
 	records, err := listStoredTorrents()
 	if err != nil {
-		log.Printf("Error listing stored torrents: %v", err)
+		log.Printf("[saved-torrents] req=%s list error=%v", reqID, err)
 		respondWithJSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to list stored torrents"})
 		return
 	}
+	log.Printf("[saved-torrents] req=%s count=%d ids=%s", reqID, len(records), summarizeIDs(extractStoredTorrentIDs(records), 8))
 
 	response := make([]StoredTorrentView, 0, len(records))
 	for _, record := range records {
@@ -1082,12 +1989,123 @@ func listSavedTorrentsHandler(w http.ResponseWriter, r *http.Request) {
 	respondWithJSON(w, http.StatusOK, response)
 }
 
+func playerDiagnosticsHandler(w http.ResponseWriter, r *http.Request) {
+	reqID := requestIDFromContext(r.Context())
+	logPath := resolvePlayerDiagnosticsLogPath()
+
+	switch r.Method {
+	case http.MethodPost:
+		bodyReader := io.LimitReader(r.Body, maxPlayerDiagnosticsPayloadBytes)
+		var payload map[string]interface{}
+		if err := json.NewDecoder(bodyReader).Decode(&payload); err != nil {
+			log.Printf("[player-diagnostics] req=%s decode error=%v", reqID, err)
+			respondWithJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid diagnostics payload"})
+			return
+		}
+
+		sessionID := ""
+		if rawSessionID, ok := payload["sessionId"].(string); ok {
+			sessionID = normalizeTorrentID(rawSessionID)
+		}
+		payload["sessionId"] = sessionID
+		payload["serverReceivedAt"] = time.Now().UTC().Format(time.RFC3339Nano)
+		payload["requestId"] = reqID
+		payload["remoteAddr"] = r.RemoteAddr
+		if _, exists := payload["userAgent"]; !exists {
+			payload["userAgent"] = r.UserAgent()
+		}
+
+		line, err := json.Marshal(payload)
+		if err != nil {
+			log.Printf("[player-diagnostics] req=%s marshal error=%v", reqID, err)
+			respondWithJSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to encode diagnostics payload"})
+			return
+		}
+
+		if err := appendPlayerDiagnosticsLine(logPath, line); err != nil {
+			log.Printf("[player-diagnostics] req=%s append error path=%s err=%v", reqID, logPath, err)
+			respondWithJSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to store diagnostics payload"})
+			return
+		}
+
+		log.Printf(
+			"[player-diagnostics] req=%s stored path=%s session=%s bytes=%d kind=%v reason=%v",
+			reqID,
+			logPath,
+			sessionID,
+			len(line),
+			payload["kind"],
+			payload["reason"],
+		)
+		respondWithJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+		return
+
+	case http.MethodGet:
+		limit := defaultPlayerDiagnosticsReadLimit
+		if rawLimit := strings.TrimSpace(r.URL.Query().Get("limit")); rawLimit != "" {
+			parsedLimit, err := strconv.Atoi(rawLimit)
+			if err != nil {
+				respondWithJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid 'limit' query parameter"})
+				return
+			}
+			limit = parsedLimit
+		}
+
+		if limit < 1 {
+			limit = 1
+		}
+		if limit > maxPlayerDiagnosticsReadLimit {
+			limit = maxPlayerDiagnosticsReadLimit
+		}
+
+		sessionFilter := normalizeTorrentID(r.URL.Query().Get("sessionId"))
+		lines, err := readRecentPlayerDiagnosticsLines(logPath, limit, sessionFilter)
+		if err != nil {
+			log.Printf("[player-diagnostics] req=%s read error path=%s err=%v", reqID, logPath, err)
+			respondWithJSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to read diagnostics log"})
+			return
+		}
+
+		log.Printf(
+			"[player-diagnostics] req=%s read path=%s lines=%d filter_session=%q",
+			reqID,
+			logPath,
+			len(lines),
+			sessionFilter,
+		)
+
+		if strings.EqualFold(r.URL.Query().Get("format"), "json") {
+			respondWithJSON(w, http.StatusOK, map[string]interface{}{
+				"logPath":   logPath,
+				"limit":     limit,
+				"sessionId": sessionFilter,
+				"count":     len(lines),
+				"lines":     lines,
+			})
+			return
+		}
+
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("X-Player-Diagnostics-Log-Path", logPath)
+		if len(lines) == 0 {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		_, _ = w.Write([]byte(strings.Join(lines, "\n")))
+		return
+	}
+
+	http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+}
+
 // Handler to add a torrent using a magnet link
 func addTorrentHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	reqID := requestIDFromContext(r.Context())
+	log.Printf("[add-torrent] req=%s request remote=%s ua=%q", reqID, r.RemoteAddr, r.UserAgent())
 
 	var request struct {
 		Magnet string `json:"magnet"`
@@ -1099,33 +2117,49 @@ func addTorrentHandler(w http.ResponseWriter, r *http.Request) {
 
 	magnet, err := resolveMagnetInput(request.Magnet)
 	if err != nil {
+		log.Printf("[add-torrent] req=%s resolve magnet failed err=%v", reqID, err)
 		respondWithJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
+	log.Printf("[add-torrent] req=%s resolved magnet hash=%s", reqID, extractInfoHashFromMagnet(magnet))
 
 	sessionID, err := getOrCreateSessionByMagnet(magnet)
 	if err != nil {
 		if strings.Contains(err.Error(), "timeout getting info") {
+			log.Printf("[add-torrent] req=%s timeout while preparing session err=%v", reqID, err)
 			respondWithJSON(w, http.StatusGatewayTimeout, map[string]string{"error": err.Error()})
 			return
 		}
 		if strings.Contains(err.Error(), "invalid magnet") {
+			log.Printf("[add-torrent] req=%s invalid magnet err=%v", reqID, err)
 			respondWithJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid magnet url"})
 			return
 		}
-		log.Printf("Error creating torrent session: %v", err)
+		log.Printf("[add-torrent] req=%s create session error: %v", reqID, err)
 		respondWithJSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to create torrent session"})
 		return
 	}
 
 	markStoredTorrentUsed(sessionID)
+	log.Printf("[add-torrent] req=%s session ready id=%s", reqID, sessionID)
 	respondWithJSON(w, http.StatusOK, map[string]string{"sessionId": sessionID})
 }
 
 // Torrent handler to serve torrent files and stream content
 func torrentHandler(w http.ResponseWriter, r *http.Request) {
+	reqID := requestIDFromContext(r.Context())
 	parts := strings.Split(r.URL.Path, "/")
+	log.Printf(
+		"[torrent-handler] req=%s request path=%s query=%q remote=%s range=%q ua=%q",
+		reqID,
+		r.URL.Path,
+		r.URL.RawQuery,
+		r.RemoteAddr,
+		r.Header.Get("Range"),
+		r.UserAgent(),
+	)
 	if len(parts) < 5 {
+		log.Printf("[torrent-handler] req=%s invalid path parts=%v", reqID, parts)
 		respondWithJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid path"})
 		return
 	}
@@ -1133,6 +2167,7 @@ func torrentHandler(w http.ResponseWriter, r *http.Request) {
 	sessionID := normalizeTorrentID(parts[4])
 	session, err := ensureTorrentSession(sessionID)
 	if err != nil {
+		log.Printf("[torrent-handler] req=%s session unavailable id=%s err=%v", reqID, sessionID, err)
 		respondWithJSON(w, http.StatusNotFound, map[string]string{
 			"error": "Torrent not found",
 			"id":    sessionID,
@@ -1140,22 +2175,195 @@ func torrentHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// If there's a streaming request, handle it
+	if len(parts) > 5 && parts[5] == "diagnostics" {
+		if r.Method != http.MethodGet {
+			log.Printf("[torrent-handler] req=%s diagnostics unsupported method=%s", reqID, r.Method)
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if len(parts) != 6 {
+			log.Printf("[torrent-handler] req=%s invalid diagnostics path parts=%v", reqID, parts)
+			respondWithJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid diagnostics path"})
+			return
+		}
+
+		diagnostics := buildTorrentDiagnostics(sessionID, session)
+		log.Printf(
+			"[torrent-handler] req=%s diagnostics session=%s peers_total=%d peers_active=%d progress=%.2f download_rate_bps=%.0f upload_rate_bps=%.0f",
+			reqID,
+			sessionID,
+			diagnostics.TotalPeers,
+			diagnostics.ActivePeers,
+			diagnostics.Progress,
+			diagnostics.DownloadRateBps,
+			diagnostics.UploadRateBps,
+		)
+		respondWithJSON(w, http.StatusOK, diagnostics)
+		return
+	}
+
+	if len(parts) > 5 && parts[5] == "transcode" {
+		if len(parts) < 7 {
+			log.Printf("[torrent-handler] req=%s invalid transcode path parts=%v", reqID, parts)
+			http.Error(w, "Invalid transcode path", http.StatusBadRequest)
+			return
+		}
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			log.Printf("[torrent-handler] req=%s transcode unsupported method=%s", reqID, r.Method)
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		fileIndex, err := parseFileIndex(parts[6], len(session.Torrent.Files()))
+		if err != nil {
+			log.Printf(
+				"[torrent-handler] req=%s invalid transcode file index raw=%q max_files=%d err=%v",
+				reqID,
+				parts[6],
+				len(session.Torrent.Files()),
+				err,
+			)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		startSeconds, err := parseStartSeconds(r.URL.Query().Get("start"))
+		if err != nil {
+			log.Printf(
+				"[torrent-handler] req=%s invalid transcode start session=%s file_index=%d raw=%q err=%v",
+				reqID,
+				sessionID,
+				fileIndex,
+				r.URL.Query().Get("start"),
+				err,
+			)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		file := session.Torrent.Files()[fileIndex]
+		fileName := file.DisplayPath()
+		extension := strings.ToLower(filepath.Ext(fileName))
+		if !isVideoExtension(extension) {
+			log.Printf(
+				"[torrent-handler] req=%s transcode unsupported extension session=%s file_index=%d ext=%s file=%q",
+				reqID,
+				sessionID,
+				fileIndex,
+				extension,
+				fileName,
+			)
+			http.Error(w, "Unsupported file type for transcode", http.StatusBadRequest)
+			return
+		}
+
+		file.SetPriority(torrent.PiecePriorityHigh)
+		file.Download()
+		progress := buildFileProgressSnapshot(file)
+		log.Printf(
+			"[torrent-handler] req=%s transcode prioritize session=%s file_index=%d priority=%d bytes_completed=%d file_completed_bytes=%d file_contiguous_bytes=%d file_total_bytes=%d file_pieces=%d/%d",
+			reqID,
+			sessionID,
+			fileIndex,
+			file.Priority(),
+			file.BytesCompleted(),
+			progress.CompletedBytes,
+			progress.ContiguousBytes,
+			progress.TotalBytes,
+			progress.PiecesComplete,
+			progress.PiecesTotal,
+		)
+
+		if r.Method == http.MethodGet {
+			startupTargetBytes := int64(transcodeStartupMinContiguousBytes)
+			if file.Length() > 0 && file.Length() < startupTargetBytes {
+				startupTargetBytes = file.Length()
+			}
+			startupSnapshot := progress
+			if startupTargetBytes > 0 && startupSnapshot.ContiguousBytes < startupTargetBytes {
+				waitStartedAt := time.Now()
+				deadline := waitStartedAt.Add(transcodeStartupWaitTimeout)
+				waitReason := "timeout"
+
+				for startupSnapshot.ContiguousBytes < startupTargetBytes {
+					if r.Context().Err() != nil {
+						waitReason = "canceled"
+						break
+					}
+					if time.Now().After(deadline) {
+						break
+					}
+					time.Sleep(transcodeStartupPollInterval)
+					startupSnapshot = buildFileProgressSnapshot(file)
+				}
+
+				if startupSnapshot.ContiguousBytes >= startupTargetBytes {
+					waitReason = "ready"
+				}
+
+				log.Printf(
+					"[torrent-handler] req=%s transcode startup wait session=%s file_index=%d reason=%s waited_ms=%d target_contiguous_bytes=%d contiguous_bytes=%d completed_bytes=%d total_bytes=%d pieces=%d/%d",
+					reqID,
+					sessionID,
+					fileIndex,
+					waitReason,
+					time.Since(waitStartedAt).Milliseconds(),
+					startupTargetBytes,
+					startupSnapshot.ContiguousBytes,
+					startupSnapshot.CompletedBytes,
+					startupSnapshot.TotalBytes,
+					startupSnapshot.PiecesComplete,
+					startupSnapshot.PiecesTotal,
+				)
+			}
+		}
+
+		durationHintSeconds := resolveTranscodeDurationHint(
+			reqID,
+			sessionID,
+			fileIndex,
+			file,
+			fileName,
+			r.Method == http.MethodHead,
+		)
+
+		streamTranscodedVideo(
+			w,
+			r,
+			reqID,
+			sessionID,
+			fileIndex,
+			file,
+			fileName,
+			startSeconds,
+			durationHintSeconds,
+		)
+		return
+	}
+
+	// If there's a direct streaming request, handle it
 	if len(parts) > 5 && parts[5] == "stream" {
 		if len(parts) < 7 {
+			log.Printf("[torrent-handler] req=%s invalid stream path parts=%v", reqID, parts)
 			http.Error(w, "Invalid stream path", http.StatusBadRequest)
 			return
 		}
-
-		fileIndexString := strings.TrimSuffix(parts[6], ".vtt")
-		fileIndex, err := strconv.Atoi(fileIndexString)
-		if err != nil {
-			http.Error(w, "Invalid file index", http.StatusBadRequest)
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			log.Printf("[torrent-handler] req=%s stream unsupported method=%s", reqID, r.Method)
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 
-		if fileIndex < 0 || fileIndex >= len(session.Torrent.Files()) {
-			http.Error(w, "File index out of range", http.StatusBadRequest)
+		fileIndex, err := parseFileIndex(parts[6], len(session.Torrent.Files()))
+		if err != nil {
+			log.Printf(
+				"[torrent-handler] req=%s invalid stream file index raw=%q max_files=%d err=%v",
+				reqID,
+				parts[6],
+				len(session.Torrent.Files()),
+				err,
+			)
+			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 
@@ -1164,6 +2372,38 @@ func torrentHandler(w http.ResponseWriter, r *http.Request) {
 		// Set appropriate Content-Type based on file extension
 		fileName := file.DisplayPath()
 		extension := strings.ToLower(filepath.Ext(fileName))
+		isVideo := isVideoExtension(extension)
+
+		if isVideo {
+			file.SetPriority(torrent.PiecePriorityHigh)
+			file.Download()
+			progress := buildFileProgressSnapshot(file)
+			log.Printf(
+				"[torrent-handler] req=%s prioritize file session=%s file_index=%d priority=%d bytes_completed=%d file_completed_bytes=%d file_contiguous_bytes=%d file_total_bytes=%d file_pieces=%d/%d",
+				reqID,
+				sessionID,
+				fileIndex,
+				file.Priority(),
+				file.BytesCompleted(),
+				progress.CompletedBytes,
+				progress.ContiguousBytes,
+				progress.TotalBytes,
+				progress.PiecesComplete,
+				progress.PiecesTotal,
+			)
+		}
+
+		log.Printf(
+			"[torrent-handler] req=%s direct stream session=%s file_index=%d ext=%s size=%d file=%q method=%s range=%q",
+			reqID,
+			sessionID,
+			fileIndex,
+			extension,
+			file.Length(),
+			fileName,
+			r.Method,
+			r.Header.Get("Range"),
+		)
 
 		switch extension {
 		case ".mp4":
@@ -1205,13 +2445,32 @@ func torrentHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		reader := file.NewReader()
+		if isVideo {
+			reader.SetResponsive()
+			reader.SetReadahead(videoStreamReadaheadBytes)
+			w.Header().Set("X-BitPlay-Stream-Readahead", strconv.FormatInt(videoStreamReadaheadBytes, 10))
+			w.Header().Set("X-BitPlay-Reader-Mode", "responsive")
+		}
 		defer func() {
 			if closer, ok := reader.(io.Closer); ok {
 				closer.Close()
 			}
 		}()
 
+		log.Printf(
+			"[torrent-handler] req=%s servecontent session=%s file_index=%d content_type=%q",
+			reqID,
+			sessionID,
+			fileIndex,
+			w.Header().Get("Content-Type"),
+		)
 		http.ServeContent(w, r, fileName, time.Time{}, reader)
+		return
+	}
+
+	if len(parts) > 5 {
+		log.Printf("[torrent-handler] req=%s unsupported action=%q path=%s", reqID, parts[5], r.URL.Path)
+		respondWithJSON(w, http.StatusBadRequest, map[string]string{"error": "Unsupported torrent action"})
 		return
 	}
 
@@ -1223,6 +2482,7 @@ func torrentHandler(w http.ResponseWriter, r *http.Request) {
 			Size:  file.Length(),
 		})
 	}
+	log.Printf("[torrent-handler] req=%s list files session=%s count=%d", reqID, sessionID, len(files))
 
 	respondWithJSON(w, http.StatusOK, files)
 }
