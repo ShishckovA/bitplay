@@ -79,8 +79,9 @@ const PLAYER_STALL_RECOVERY_SEEK_BOOTSTRAP_STUCK_SECONDS = 45;
 const PLAYER_STALL_RECOVERY_MIN_COOLDOWN_MS = 9000;
 const PLAYER_STALL_RECOVERY_MAX_ATTEMPTS_PER_SOURCE = 8;
 const PLAYER_COMPAT_BOOTSTRAP_RETRY_DELAY_MS = 2500;
-const PLAYER_COMPAT_BOOTSTRAP_MAX_ATTEMPTS = 10;
-const PLAYER_COMPAT_BOOTSTRAP_SEEK_BACKOFF_SECONDS = 1.0;
+const PLAYER_COMPAT_BOOTSTRAP_MAX_ATTEMPTS = 16;
+const PLAYER_COMPAT_BOOTSTRAP_SEEK_BACKOFF_BASE_SECONDS = 2.5;
+const PLAYER_COMPAT_BOOTSTRAP_SEEK_BACKOFF_MAX_SECONDS = 180;
 const PLAYER_COMPAT_VIRTUAL_NATIVE_DURATION_THRESHOLD_SECONDS = 6;
 const PLAYER_COMPAT_VIRTUAL_SEEK_DEBOUNCE_MS = 220;
 const PLAYER_COMPAT_VIRTUAL_SOURCE_SETTLE_BYPASS_MS = 1200;
@@ -1477,6 +1478,26 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
       return Math.max(0, clampNumber(compatVirtualTimeline.sourceStartSeconds, 0));
     };
 
+    const resolveCompatNativeSeekSeconds = (virtualSeconds) => {
+      const targetSeconds = Math.max(0, clampNumber(virtualSeconds, 0));
+      const sourceStartSeconds = resolveCompatSourceStartSeconds();
+      let nativeTargetSeconds = Math.max(0, targetSeconds - sourceStartSeconds);
+
+      if (mediaElement) {
+        const nativeDuration = clampNumber(mediaElement.duration, 0);
+        if (nativeDuration > 0) {
+          nativeTargetSeconds = Math.min(
+            nativeTargetSeconds,
+            Math.max(0, nativeDuration - 0.05)
+          );
+        } else if (mediaElement.readyState <= 0 && nativeTargetSeconds > 0.25) {
+          nativeTargetSeconds = 0;
+        }
+      }
+
+      return nativeTargetSeconds;
+    };
+
     const readCompatVirtualCurrentTimeFromMedia = () => {
       if (!compatVirtualTimeline.enabled || !mediaElement) return null;
       const nativeCurrentTime = clampNumber(mediaElement.currentTime, -1);
@@ -1591,12 +1612,13 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
             return nativeMethods.setCurrentTime(seconds);
           }
           const targetSeconds = clampNumber(seconds, getCompatVirtualCurrentTime());
+          const nativeTargetSeconds = resolveCompatNativeSeekSeconds(targetSeconds);
           const bypassSeek = Date.now() < compatVirtualSeekBypassUntilMs;
           if (bypassSeek) {
-            return nativeMethods.setCurrentTime(targetSeconds);
+            return nativeMethods.setCurrentTime(nativeTargetSeconds);
           }
           if (!scheduleCompatVirtualSeek(targetSeconds, "tech.setCurrentTime")) {
-            return nativeMethods.setCurrentTime(targetSeconds);
+            return nativeMethods.setCurrentTime(nativeTargetSeconds);
           }
           return targetSeconds;
         };
@@ -1840,6 +1862,16 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
       }
     };
 
+    const clearPlayerErrorState = (reason) => {
+      if (!player || typeof player.error !== "function") return;
+      try {
+        if (player.error()) {
+          playerDebug("clearing player error state", { reason });
+          player.error(null);
+        }
+      } catch (error) {}
+    };
+
     const resolveCompatBootstrapStartSeconds = (activeSource, preferredStartSeconds = 0) => {
       const preferred = clampNumber(preferredStartSeconds, 0);
       if (preferred > 0) return preferred;
@@ -1886,6 +1918,13 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
 
       const nextAttempt = attempts + 1;
       sourceCompatBootstrapRetryAttempts[key] = nextAttempt;
+      const seekBackoffSeconds =
+        seekStartSeconds > 0
+          ? Math.min(
+              PLAYER_COMPAT_BOOTSTRAP_SEEK_BACKOFF_MAX_SECONDS,
+              PLAYER_COMPAT_BOOTSTRAP_SEEK_BACKOFF_BASE_SECONDS * nextAttempt
+            )
+          : 0;
 
       playerWarn("scheduling compatibility bootstrap retry", {
         activeSource,
@@ -1893,6 +1932,7 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
         attempt: nextAttempt,
         delayMs: PLAYER_COMPAT_BOOTSTRAP_RETRY_DELAY_MS,
         seekStartSeconds,
+        seekBackoffSeconds,
         mediaError,
       });
 
@@ -1906,10 +1946,7 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
         );
         let transcodeStartSeconds = 0;
         if (seekStartSeconds > 0) {
-          transcodeStartSeconds = Math.max(
-            0,
-            seekStartSeconds - PLAYER_COMPAT_BOOTSTRAP_SEEK_BACKOFF_SECONDS
-          );
+          transcodeStartSeconds = Math.max(0, seekStartSeconds - seekBackoffSeconds);
           compatSourceSrc = addQueryParam(
             compatSourceSrc,
             "start",
@@ -1932,6 +1969,7 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
           attempt: nextAttempt,
           source: compatSource.src,
           seekStartSeconds,
+          seekBackoffSeconds,
           transcodeStartSeconds,
         });
 
@@ -1940,6 +1978,7 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
           target: key,
           attempt: nextAttempt,
           seekStartSeconds,
+          seekBackoffSeconds,
           transcodeStartSeconds,
         });
         player.play().catch((error) => {
@@ -2212,12 +2251,13 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
           }
 
           const bypassSeek = Date.now() < compatVirtualSeekBypassUntilMs;
+          const nativeTargetSeconds = resolveCompatNativeSeekSeconds(seconds);
           if (bypassSeek) {
-            return nativePlayerCurrentTime(seconds);
+            return nativePlayerCurrentTime(nativeTargetSeconds);
           }
 
           if (!scheduleCompatVirtualSeek(seconds, "player.currentTime")) {
-            return nativePlayerCurrentTime(seconds);
+            return nativePlayerCurrentTime(nativeTargetSeconds);
           }
           return getCompatVirtualCurrentTime();
         };
@@ -2475,15 +2515,19 @@ videojs.registerPlugin('doubleTapFF', doubleTapFF);
               mediaError: normalizedMediaError,
             });
             if (scheduleCompatBootstrapRetry(activeVideo, activeSource, normalizedMediaError)) {
+              clearPlayerErrorState("recovery-source");
               return;
             }
+            clearPlayerErrorState("recovery-source");
             return;
           }
 
           if (retryPlaybackAfterError(activeSource, normalizedMediaError)) {
+            clearPlayerErrorState("error-retry");
             return;
           }
           if (scheduleCompatBootstrapRetry(activeVideo, activeSource, normalizedMediaError)) {
+            clearPlayerErrorState("compat-bootstrap-retry");
             return;
           }
 

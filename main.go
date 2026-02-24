@@ -1300,6 +1300,11 @@ func streamTranscodedVideo(
 	inputMode := "pipe"
 	inputTarget := "pipe:0"
 	usePipeInput := true
+	x264Params := "keyint=48:min-keyint=48:scenecut=0"
+	movflags := "frag_keyframe+empty_moov+default_base_moof"
+	videoRateArgs := []string{}
+	inputSeekSeconds := 0.0
+	outputSeekSeconds := 0.0
 
 	if startSeconds > 0 {
 		inputMode = "http-seekable-stream"
@@ -1310,7 +1315,19 @@ func streamTranscodedVideo(
 			fileIndex,
 		)
 
-		args = append(args, "-ss", fmt.Sprintf("%.3f", startSeconds))
+		// Prefer compatibility-oriented flags for seek restarts on embedded browsers.
+		args[5] = "+genpts"
+		x264Params = "keyint=24:min-keyint=24:scenecut=0:bframes=0:repeat-headers=1:aud=1"
+		movflags = "frag_keyframe+empty_moov+default_base_moof"
+		// Keep seek restarts decoder-friendly on low-power TV browsers.
+		videoRateArgs = []string{"-b:v", "4M", "-maxrate", "4M", "-bufsize", "8M"}
+		outputSeekSeconds = 8.0
+		if startSeconds < outputSeekSeconds {
+			outputSeekSeconds = startSeconds
+		}
+		inputSeekSeconds = startSeconds - outputSeekSeconds
+
+		args = append(args, "-ss", fmt.Sprintf("%.3f", inputSeekSeconds))
 		if authHeader := resolveInternalBasicAuthHeader(); authHeader != "" {
 			args = append(args, "-headers", authHeader)
 		}
@@ -1322,6 +1339,9 @@ func streamTranscodedVideo(
 	} else {
 		args = append(args, "-i", inputTarget)
 	}
+	if outputSeekSeconds > 0 {
+		args = append(args, "-ss", fmt.Sprintf("%.3f", outputSeekSeconds))
+	}
 
 	args = append(args,
 		"-map", "0:v:0",
@@ -1331,25 +1351,31 @@ func streamTranscodedVideo(
 		"-tune", "zerolatency",
 		"-profile:v", "main",
 		"-level", "4.0",
-		"-x264-params", "keyint=48:min-keyint=48:scenecut=0",
+	)
+	args = append(args, videoRateArgs...)
+	args = append(args,
+		"-x264-params", x264Params,
 		"-pix_fmt", "yuv420p",
 		"-c:a", "aac",
 		"-ac", "2",
 		"-b:a", "160k",
+		"-max_interleave_delta", "0",
 		"-muxdelay", "0",
 		"-muxpreload", "0",
-		"-movflags", "frag_keyframe+empty_moov+default_base_moof",
+		"-movflags", movflags,
 		"-f", "mp4",
 		"pipe:1",
 	)
 
 	log.Printf(
-		"[torrent-handler] req=%s transcode start session=%s file_index=%d file=%q start_seconds=%.3f ffmpeg=%q args=%q",
+		"[torrent-handler] req=%s transcode start session=%s file_index=%d file=%q start_seconds=%.3f input_seek_seconds=%.3f output_seek_seconds=%.3f ffmpeg=%q args=%q",
 		reqID,
 		sessionID,
 		fileIndex,
 		fileName,
 		startSeconds,
+		inputSeekSeconds,
+		outputSeekSeconds,
 		ffmpegBinary,
 		strings.Join(sanitizeFFmpegArgs(args), " "),
 	)
